@@ -972,7 +972,7 @@ test('introspect composite fk with ON DELETE SET NULL / SET DEFAULT column lists
 	expect(foreignKeys['posts_editor_fk']!.onDelete).toBe('set default ("editorId")');
 });
 
-test('introspect keeps a unique index referenced by another table\'s foreign key', async () => {
+test("introspect keeps a unique index referenced by another table's foreign key", async () => {
 	const client = new PGlite();
 
 	await client.exec(`
