@@ -4467,7 +4467,26 @@ test('push: unique index referenced by a foreign key from another table does not
 
 	const schema = { accounts, memberships };
 
-	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+	// Created by hand: the generated DDL adds foreign keys before indexes, so the referenced
+	// unique index would not exist yet when the foreign key is added.
+	const { statements, sqlStatements } = await diffTestSchemasPush(
+		client,
+		schema,
+		schema,
+		[],
+		false,
+		['public'],
+		undefined,
+		undefined,
+		{
+			before: [
+				'CREATE TABLE "accounts" ("id" integer PRIMARY KEY NOT NULL, "slug" text NOT NULL);',
+				'CREATE UNIQUE INDEX "accounts_slug_idx" ON "accounts" USING btree ("slug");',
+				'CREATE TABLE "memberships" ("id" integer PRIMARY KEY NOT NULL, "account_slug" text NOT NULL, CONSTRAINT "memberships_account_slug_fk" FOREIGN KEY ("account_slug") REFERENCES "accounts"("slug"));',
+			],
+			runApply: false,
+		},
+	);
 
 	expect(statements.length).toBe(0);
 	expect(sqlStatements.length).toBe(0);

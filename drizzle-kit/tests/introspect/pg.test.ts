@@ -39,6 +39,7 @@ import {
 	varchar,
 } from 'drizzle-orm/pg-core';
 import fs from 'fs';
+import { fromDatabase } from 'src/serializer/pgSerializer';
 import { introspectPgToFile } from 'tests/schemaDiffer';
 import { expect, test } from 'vitest';
 
@@ -965,39 +966,39 @@ test('introspect composite fk with ON DELETE SET NULL / SET DEFAULT column lists
 	expect(statements.length).toBe(0);
 	expect(sqlStatements.length).toBe(0);
 
-	const file = fs.readFileSync('tests/introspect/postgres/introspect-fk-delete-column-list.ts', 'utf8');
-	expect(file).toContain('.onDelete("set null (author_id)")');
-	expect(file).toContain('.onDelete("set default (\\"editorId\\")")');
+	const introspected = await introspectPublicSchema(client);
+	const foreignKeys = introspected.tables['public.posts']!.foreignKeys;
+	expect(foreignKeys['posts_author_fk']!.onDelete).toBe('set null (author_id)');
+	expect(foreignKeys['posts_editor_fk']!.onDelete).toBe('set default ("editorId")');
 });
 
 test('introspect keeps a unique index referenced by another table\'s foreign key', async () => {
 	const client = new PGlite();
 
-	const accounts = pgTable('accounts', {
-		id: integer('id').primaryKey(),
-		slug: text('slug').notNull(),
-	}, (t) => [uniqueIndex('accounts_slug_idx').on(t.slug)]);
+	await client.exec(`
+		CREATE TABLE "accounts" ("id" integer PRIMARY KEY NOT NULL, "slug" text NOT NULL);
+		CREATE UNIQUE INDEX "accounts_slug_idx" ON "accounts" USING btree ("slug");
+		CREATE TABLE "memberships" (
+			"id" integer PRIMARY KEY NOT NULL,
+			"account_slug" text NOT NULL,
+			CONSTRAINT "memberships_account_slug_fk" FOREIGN KEY ("account_slug") REFERENCES "accounts"("slug")
+		);
+	`);
 
-	const memberships = pgTable('memberships', {
-		id: integer('id').primaryKey(),
-		accountSlug: text('account_slug').notNull(),
-	}, (t) => [
-		foreignKey({
-			name: 'memberships_account_slug_fk',
-			columns: [t.accountSlug],
-			foreignColumns: [accounts.slug],
-		}),
-	]);
-
-	const { statements, sqlStatements } = await introspectPgToFile(
-		client,
-		{ accounts, memberships },
-		'introspect-referenced-unique-index',
-	);
-
-	expect(statements.length).toBe(0);
-	expect(sqlStatements.length).toBe(0);
-
-	const file = fs.readFileSync('tests/introspect/postgres/introspect-referenced-unique-index.ts', 'utf8');
-	expect(file).toContain('uniqueIndex("accounts_slug_idx")');
+	const introspected = await introspectPublicSchema(client);
+	expect(Object.keys(introspected.tables['public.accounts']!.indexes)).toEqual(['accounts_slug_idx']);
+	expect(introspected.tables['public.accounts']!.indexes['accounts_slug_idx']!.isUnique).toBe(true);
 });
+
+async function introspectPublicSchema(client: PGlite) {
+	return fromDatabase(
+		{
+			query: async (query: string, values?: any[] | undefined) => {
+				const res = await client.query(query, values);
+				return res.rows as any[];
+			},
+		},
+		undefined,
+		['public'],
+	);
+}
