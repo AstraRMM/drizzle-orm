@@ -419,7 +419,7 @@ export const preparePgPush = async (
 	prev: PgSchema,
 ) => {
 	const validatedPrev = pgSchema.parse(prev);
-	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur));
+	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur), validatedPrev);
 
 	const squashedPrev = squashPgScheme(validatedPrev, 'push');
 	const squashedCur = squashPgScheme(validatedCur, 'push');

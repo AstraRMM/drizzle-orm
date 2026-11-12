@@ -813,69 +813,110 @@ export function truncatePgSchemaIdentifiers<T extends PgSchema>(json: T): T {
 	};
 }
 
-const pgNumericColumnTypes = new Set(['smallint', 'integer', 'bigint', 'real', 'double precision']);
-
-// Same trailing-cast stripping the database side applies in defaultForColumn.
-function stripTrailingCast(value: string): string {
-	const withoutArraySuffix = value.endsWith('[]') ? value.slice(0, -2) : value;
-	return withoutArraySuffix.replace(/::(.*?)(?<![^\w"])(?=$)/, '');
+function mapEntries<IN, OUT>(obj: Record<string, IN>, map: (value: IN, key: string) => OUT): Record<string, OUT> {
+	return Object.fromEntries(Object.entries(obj).map(([key, value]) => [key, map(value, key)]));
 }
 
-function normalizePushDefault(column: Column): Column {
-	const value = column.default;
-	if (typeof value !== 'string') return column;
-	const type = column.type.toLowerCase();
-	if (pgNumericColumnTypes.has(type)) {
-		const literal = /^\(?\s*'?(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)'?\s*\)?$/i.exec(value.trim());
-		if (literal) return { ...column, default: Number(literal[1]) };
+const pgNumericColumnTypes = new Set(['smallint', 'integer', 'bigint', 'real', 'double precision']);
+
+function stripWrappingParens(value: string): string {
+	let current = value.trim();
+	while (current.startsWith('(') && current.endsWith(')')) {
+		let depth = 0;
+		let wrapsWhole = true;
+		for (let i = 0; i < current.length; i++) {
+			if (current[i] === '(') depth++;
+			else if (current[i] === ')') depth--;
+			if (depth === 0 && i < current.length - 1) {
+				wrapsWhole = false;
+				break;
+			}
+		}
+		if (!wrapsWhole) break;
+		current = current.slice(1, -1).trim();
 	}
-	// Literals and json defaults are already compared in the form the database reports.
-	if (value.startsWith("'") || type === 'json' || type === 'jsonb') return column;
-	const stripped = stripTrailingCast(value);
-	return stripped === value ? column : { ...column, default: stripped };
+	return current;
+}
+
+/** A column default in a form where PostgreSQL's rewrites of the same expression compare equal. */
+function comparablePushDefault(value: unknown, type: string): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+	if (typeof value !== 'string') return JSON.stringify(value);
+	const lowered = type.toLowerCase();
+	if (lowered === 'json' || lowered === 'jsonb') return value;
+	let current = value.trim();
+	for (let previous = ''; previous !== current;) {
+		previous = current;
+		current = stripWrappingParens(current);
+		// The same trailing-cast stripping the database side applies in defaultForColumn.
+		if (current.endsWith('[]') && !current.startsWith("'")) current = current.slice(0, -2);
+		if (!current.startsWith("'") || /'::/.test(current)) {
+			current = current.replace(/::(.*?)(?<![^\w"])(?=$)/, '');
+		}
+	}
+	if (pgNumericColumnTypes.has(lowered)) {
+		const literal = /^'?(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)'?$/i.exec(current);
+		if (literal) return String(Number(literal[1]));
+	}
+	return current;
 }
 
 const trailingOrdering = /\s+(asc|desc)(?:\s+nulls\s+(first|last))?\s*$|\s+nulls\s+(first|last)\s*$/i;
 
-function normalizePushIndexColumn(column: Index['columns'][number], columnNames: Set<string>) {
-	if (!column.isExpression) return column;
+/** An index column in a form where raw SQL ordering and bare column references compare equal. */
+function comparablePushIndexColumn(column: Index['columns'][number]) {
+	if (!column.isExpression) return `${column.expression}--${column.asc}--${column.nulls}`;
 	let expression = column.expression.trim();
 	let { asc, nulls } = column;
 	const ordering = trailingOrdering.exec(expression);
 	if (ordering) {
 		expression = expression.slice(0, ordering.index).trim();
-		const direction = ordering[1]?.toLowerCase();
-		asc = direction !== 'desc';
-		nulls = (ordering[2] ?? ordering[3])?.toLowerCase() as typeof nulls ?? (asc ? 'last' : 'first');
+		asc = ordering[1]?.toLowerCase() !== 'desc';
+		nulls = ((ordering[2] ?? ordering[3])?.toLowerCase() as typeof nulls) ?? (asc ? 'last' : 'first');
 	}
 	// PostgreSQL stores an expression that is only a column reference as that plain column.
-	const bare = /^(?:"([^"]+)"|([a-z_][a-z0-9_$]*))$/.exec(expression);
-	const columnName = bare ? bare[1] ?? bare[2] : undefined;
-	if (columnName !== undefined && columnNames.has(columnName)) {
-		return { ...column, expression: columnName, isExpression: false, asc, nulls };
-	}
-	return { ...column, expression, asc, nulls };
+	const bare = /^(?:"([^"]+)"|([a-z_][a-z0-9_$]*))$/.exec(stripWrappingParens(expression));
+	return `${bare ? bare[1] ?? bare[2] : ''}--${asc}--${nulls}`;
+}
+
+function comparablePushIndex(idx: Index): string {
+	return `${idx.columns.map(comparablePushIndexColumn).join(',,')};${idx.isUnique};${idx.method};${
+		JSON.stringify(idx.with)
+	};${idx.where ?? ''}`;
 }
 
 /**
  * Prepares the schema side of a push to be compared with the database: names as PostgreSQL
- * stores them, column defaults in the form introspection reports them, and index ordering
- * written inside raw SQL as the column's ordering. Only push uses this, so snapshots and
- * generated migrations are unchanged.
+ * stores them, and every column default or index that only differs from the database by how
+ * PostgreSQL rewrites it replaced by the database's own form. Anything that really differs
+ * keeps the schema's text, so push emits the SQL the user wrote. Only push uses this, so
+ * snapshots and generated migrations are unchanged.
  */
-export function normalizePgPushSchema<T extends PgSchema>(json: T): T {
+export function normalizePgPushSchema<T extends PgSchema>(json: T, database: PgSchema): T {
 	const truncated = truncatePgSchemaIdentifiers(json);
 	return {
 		...truncated,
-		tables: mapValues(truncated.tables, (table) => {
-			const columnNames = new Set(Object.keys(table.columns));
+		tables: mapEntries(truncated.tables, (table, key) => {
+			const dbTable = database.tables[key];
+			if (!dbTable) return table;
 			return {
 				...table,
-				columns: mapValues(table.columns, normalizePushDefault),
-				indexes: mapValues(table.indexes, (idx) => ({
-					...idx,
-					columns: idx.columns.map((column) => normalizePushIndexColumn(column, columnNames)),
-				})),
+				columns: mapEntries(table.columns, (column, name) => {
+					const dbColumn = dbTable.columns[name];
+					if (!dbColumn || column.default === dbColumn.default) return column;
+					const same = comparablePushDefault(column.default, column.type)
+						=== comparablePushDefault(dbColumn.default, dbColumn.type);
+					return same ? { ...column, default: dbColumn.default } : column;
+				}),
+				indexes: mapEntries(table.indexes, (idx, name) => {
+					const dbIndex = dbTable.indexes[name];
+					if (!dbIndex) return idx;
+					// The WHERE clause is not compared by push (see squashIdxPush); keep it out here too.
+					const same = comparablePushIndex({ ...idx, where: undefined })
+						=== comparablePushIndex({ ...dbIndex, where: undefined });
+					return same ? { ...dbIndex, concurrently: idx.concurrently } : idx;
+				}),
 			};
 		}),
 	};

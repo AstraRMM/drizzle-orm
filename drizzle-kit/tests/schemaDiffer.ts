@@ -1051,6 +1051,7 @@ export const diffTestSchemasPush = async (
 			prevId: '0',
 			...rest2,
 		} as const,
+		pgSchema.parse(sch1),
 	);
 
 	const sn1 = squashPgScheme(sch1, 'push');
