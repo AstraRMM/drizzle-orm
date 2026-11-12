@@ -813,6 +813,74 @@ export function truncatePgSchemaIdentifiers<T extends PgSchema>(json: T): T {
 	};
 }
 
+const pgNumericColumnTypes = new Set(['smallint', 'integer', 'bigint', 'real', 'double precision']);
+
+// Same trailing-cast stripping the database side applies in defaultForColumn.
+function stripTrailingCast(value: string): string {
+	const withoutArraySuffix = value.endsWith('[]') ? value.slice(0, -2) : value;
+	return withoutArraySuffix.replace(/::(.*?)(?<![^\w"])(?=$)/, '');
+}
+
+function normalizePushDefault(column: Column): Column {
+	const value = column.default;
+	if (typeof value !== 'string') return column;
+	const type = column.type.toLowerCase();
+	if (pgNumericColumnTypes.has(type)) {
+		const literal = /^\(?\s*'?(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)'?\s*\)?$/i.exec(value.trim());
+		if (literal) return { ...column, default: Number(literal[1]) };
+	}
+	// Literals and json defaults are already compared in the form the database reports.
+	if (value.startsWith("'") || type === 'json' || type === 'jsonb') return column;
+	const stripped = stripTrailingCast(value);
+	return stripped === value ? column : { ...column, default: stripped };
+}
+
+const trailingOrdering = /\s+(asc|desc)(?:\s+nulls\s+(first|last))?\s*$|\s+nulls\s+(first|last)\s*$/i;
+
+function normalizePushIndexColumn(column: Index['columns'][number], columnNames: Set<string>) {
+	if (!column.isExpression) return column;
+	let expression = column.expression.trim();
+	let { asc, nulls } = column;
+	const ordering = trailingOrdering.exec(expression);
+	if (ordering) {
+		expression = expression.slice(0, ordering.index).trim();
+		const direction = ordering[1]?.toLowerCase();
+		asc = direction !== 'desc';
+		nulls = (ordering[2] ?? ordering[3])?.toLowerCase() as typeof nulls ?? (asc ? 'last' : 'first');
+	}
+	// PostgreSQL stores an expression that is only a column reference as that plain column.
+	const bare = /^(?:"([^"]+)"|([a-z_][a-z0-9_$]*))$/.exec(expression);
+	const columnName = bare ? bare[1] ?? bare[2] : undefined;
+	if (columnName !== undefined && columnNames.has(columnName)) {
+		return { ...column, expression: columnName, isExpression: false, asc, nulls };
+	}
+	return { ...column, expression, asc, nulls };
+}
+
+/**
+ * Prepares the schema side of a push to be compared with the database: names as PostgreSQL
+ * stores them, column defaults in the form introspection reports them, and index ordering
+ * written inside raw SQL as the column's ordering. Only push uses this, so snapshots and
+ * generated migrations are unchanged.
+ */
+export function normalizePgPushSchema<T extends PgSchema>(json: T): T {
+	const truncated = truncatePgSchemaIdentifiers(json);
+	return {
+		...truncated,
+		tables: mapValues(truncated.tables, (table) => {
+			const columnNames = new Set(Object.keys(table.columns));
+			return {
+				...table,
+				columns: mapValues(table.columns, normalizePushDefault),
+				indexes: mapValues(table.indexes, (idx) => ({
+					...idx,
+					columns: idx.columns.map((column) => normalizePushIndexColumn(column, columnNames)),
+				})),
+			};
+		}),
+	};
+}
+
 export const squashPgScheme = (
 	json: PgSchema,
 	action?: 'push' | undefined,

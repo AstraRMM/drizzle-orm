@@ -4869,3 +4869,91 @@ test('push: a new constraint with a name over 63 bytes is added under the name P
 	});
 	expect(second.sqlStatements).toStrictEqual([]);
 });
+
+test('push: SQL defaults that PostgreSQL rewrites do not produce changes', async () => {
+	const client = new PGlite();
+	const schema = {
+		counters: pgTable('counters', {
+			id: integer('id').primaryKey(),
+			reserved: bigint('reserved', { mode: 'bigint' }).notNull().default(sql`0`),
+			sequence: bigint('sequence', { mode: 'bigint' }).notNull().default(sql`-1`),
+			generation: integer('generation').notNull().default(sql`1`),
+			uuid: text('uuid').notNull().default(sql`gen_random_uuid()::text`),
+			tags: text('tags').array().notNull().default(sql`ARRAY[]::text[]`),
+		}),
+	};
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push: changing a SQL default is still detected', async () => {
+	const client = new PGlite();
+	const table = (value: number) => ({
+		counters: pgTable('counters', {
+			id: integer('id').primaryKey(),
+			generation: integer('generation').notNull().default(sql.raw(String(value))),
+		}),
+	});
+
+	const { sqlStatements } = await diffTestSchemasPush(client, table(1), table(2), [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual(['ALTER TABLE "counters" ALTER COLUMN "generation" SET DEFAULT 2;']);
+});
+
+test('push: single-column primary key declared with primaryKey({ name }) does not produce changes', async () => {
+	const client = new PGlite();
+	const schema = {
+		deliveries: pgTable('deliveries', {
+			sourceEventId: text('source_event_id').notNull(),
+			attempts: integer('attempts').notNull(),
+		}, (t) => [primaryKey({ columns: [t.sourceEventId], name: 'delivery_source_event_pk' })]),
+		plain: pgTable('plain', { id: integer('id').primaryKey() }),
+	};
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push: indexes mixing expressions with columns, and ordering inside raw SQL, do not produce changes', async () => {
+	const client = new PGlite();
+	const schema = {
+		events: pgTable('events', {
+			id: text('id').primaryKey(),
+			repositoryId: text('repository_id').notNull(),
+			status: text('status').notNull(),
+			updatedAt: timestamp('updated_at').notNull(),
+			subjectType: text('subject_type').notNull(),
+			payload: jsonb('payload').notNull(),
+		}, (t) => [
+			index('events_opaque_idx').on(sql`substr(md5(${t.repositoryId}), 1, 16)`, t.status, t.updatedAt),
+			index('events_owner_idx').on(sql`(${t.payload}->>'tenantId')`, sql`(${t.payload}->>'ownerId')`, t.updatedAt, t.id)
+				.where(sql`${t.subjectType} = 'remote_host'`),
+			index('events_timeline_idx').on(
+				sql.raw("coalesce(payload->>'occurredAt', '') desc"),
+				sql.raw('id desc'),
+			),
+		]),
+	};
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push: changing the ordering of an expression index column is still detected', async () => {
+	const client = new PGlite();
+	const table = (direction: 'asc' | 'desc') => ({
+		events: pgTable('events', {
+			id: text('id').primaryKey(),
+			payload: jsonb('payload').notNull(),
+		}, (t) => [index('events_timeline_idx').on(sql.raw(`coalesce(payload->>'occurredAt', '') ${direction}`))]),
+	});
+
+	const { sqlStatements } = await diffTestSchemasPush(client, table('asc'), table('desc'), [], false, ['public']);
+
+	expect(sqlStatements.some((it) => it.startsWith('DROP INDEX "events_timeline_idx"'))).toBe(true);
+	expect(sqlStatements.some((it) => it.startsWith('CREATE INDEX "events_timeline_idx"'))).toBe(true);
+});

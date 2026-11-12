@@ -1487,8 +1487,12 @@ WHERE
 						);
 
 						const cprimaryKey = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'PRIMARY KEY');
+						// A column-level primary key always gets PostgreSQL's automatic "<table>_pkey" name.
+						// A single-column key with any other name was declared with primaryKey({ ... }).
+						const namedSingleColumnPk = cprimaryKey.length === 1
+							&& !String(cprimaryKey[0].constraint_name).endsWith('_pkey');
 
-						if (cprimaryKey.length > 1) {
+						if (cprimaryKey.length > 1 || namedSingleColumnPk) {
 							const tableCompositePkName = await db.query(
 								`SELECT conname AS primary_key
             FROM   pg_constraint join pg_class on (pg_class.oid = conrelid)
@@ -1583,7 +1587,7 @@ WHERE
 							typeSchema: enumsToReturn[`${typeSchema}.${enumType}`] !== undefined
 								? enumsToReturn[`${typeSchema}.${enumType}`].schema
 								: undefined,
-							primaryKey: primaryKey.length === 1 && cprimaryKey.length < 2,
+							primaryKey: primaryKey.length === 1 && cprimaryKey.length < 2 && !namedSingleColumnPk,
 							// default: isSerial ? undefined : defaultValue,
 							notNull: columnResponse.is_nullable === 'NO',
 							generated: isGenerated
@@ -1630,10 +1634,9 @@ WHERE
         am.amname as method,
         ic.reloptions as with,
         coalesce(a.attname, pg_get_indexdef(i.indexrelid, k.i, false)) AS column_name,
-          CASE
-        WHEN pg_get_expr(i.indexprs, i.indrelid) IS NOT NULL THEN 1
-        ELSE 0
-    END AS is_expression,
+        -- Per key column: attnum 0 (no pg_attribute row) is an expression. Checking indexprs
+        -- marked every column of an index with any expression as an expression.
+        CASE WHEN a.attname IS NULL THEN 1 ELSE 0 END AS is_expression,
         i.indoption[k.i-1] & 1 = 1 AS descending,
         i.indoption[k.i-1] & 2 = 2 AS nulls_first,
         pg_get_expr(
@@ -2050,6 +2053,11 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 
 	const columnDefaultAsString: string = column.column_default.toString();
 
+	// An ARRAY[...] constructor is an expression, not an array literal ('{...}').
+	if (columnDefaultAsString.startsWith('ARRAY[')) {
+		return columnDefaultAsString;
+	}
+
 	if (isArray) {
 		return `'{${
 			columnDefaultAsString
@@ -2077,6 +2085,9 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 	if (['integer', 'smallint', 'bigint', 'double precision', 'real'].includes(column.data_type)) {
 		if (/^-?[\d.]+(?:e-?\d+)?$/.test(columnDefaultAsString)) {
 			return Number(columnDefaultAsString);
+		} else if (/^'-?[\d.]+(?:e-?\d+)?'$/.test(columnDefaultAsString)) {
+			// PostgreSQL prints negative numeric constants quoted, e.g. '-1'::integer.
+			return Number(columnDefaultAsString.slice(1, -1));
 		} else {
 			if (typeof internals!.tables![tableName] === 'undefined') {
 				internals!.tables![tableName] = {

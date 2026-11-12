@@ -989,6 +989,51 @@ test("introspect keeps a unique index referenced by another table's foreign key"
 	expect(introspected.tables['public.accounts']!.indexes['accounts_slug_idx']!.isUnique).toBe(true);
 });
 
+test('introspect reads a named single-column primary key as a table-level key', async () => {
+	const client = new PGlite();
+	await client.exec(`
+		CREATE TABLE "deliveries" ("source_event_id" text NOT NULL, CONSTRAINT "delivery_source_event_pk" PRIMARY KEY ("source_event_id"));
+		CREATE TABLE "plain" ("id" integer PRIMARY KEY);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	expect(introspected.tables['public.deliveries']!.compositePrimaryKeys).toStrictEqual({
+		delivery_source_event_pk: { name: 'delivery_source_event_pk', columns: ['source_event_id'] },
+	});
+	expect(introspected.tables['public.deliveries']!.columns['source_event_id']!.primaryKey).toBe(false);
+	expect(introspected.tables['public.plain']!.compositePrimaryKeys).toStrictEqual({});
+	expect(introspected.tables['public.plain']!.columns['id']!.primaryKey).toBe(true);
+});
+
+test('introspect reads quoted negative numbers and ARRAY constructors as column defaults', async () => {
+	const client = new PGlite();
+	await client.exec(`
+		CREATE TABLE "counters" (
+			"sequence" bigint DEFAULT -1 NOT NULL,
+			"tags" text[] DEFAULT ARRAY[]::text[] NOT NULL
+		);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	expect(introspected.tables['public.counters']!.columns['sequence']!.default).toBe(-1);
+	expect(introspected.tables['public.counters']!.columns['tags']!.default).toBe('ARRAY[]');
+});
+
+test('introspect marks only the expression columns of a mixed index as expressions', async () => {
+	const client = new PGlite();
+	await client.exec(`
+		CREATE TABLE "events" ("repository_id" text NOT NULL, "status" text NOT NULL);
+		CREATE INDEX "events_opaque_idx" ON "events" (substr(md5("repository_id"), 1, 16), "status");
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	const columns = introspected.tables['public.events']!.indexes['events_opaque_idx']!.columns;
+	expect(columns.map((it) => [it.expression, it.isExpression])).toStrictEqual([
+		['substr(md5(repository_id), 1, 16)', true],
+		['status', false],
+	]);
+});
+
 async function introspectPublicSchema(client: PGlite) {
 	return fromDatabase(
 		{
