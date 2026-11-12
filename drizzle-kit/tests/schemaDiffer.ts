@@ -1043,13 +1043,15 @@ export const diffTestSchemasPush = async (
 		...rest1,
 	} as const;
 
-	const sch2 = truncatePgSchemaIdentifiers({
-		version: '7',
-		dialect: 'postgresql',
-		id: '0',
-		prevId: '0',
-		...rest2,
-	} as const);
+	const sch2 = truncatePgSchemaIdentifiers(
+		{
+			version: '7',
+			dialect: 'postgresql',
+			id: '0',
+			prevId: '0',
+			...rest2,
+		} as const,
+	);
 
 	const sn1 = squashPgScheme(sch1, 'push');
 	const sn2 = squashPgScheme(sch2, 'push');

@@ -20,33 +20,34 @@ test('truncatePgIdentifier never splits a multibyte character', () => {
 	expect(truncatePgIdentifier(`${'a'.repeat(61)}😀b`)).toBe('a'.repeat(61));
 });
 
-const tableWith = (foreignKeys: Record<string, { name: string }>) => ({
-	version: '7',
-	dialect: 'postgresql',
-	id: '0',
-	prevId: '0',
-	tables: {
-		'public.t': {
-			name: 't',
-			schema: '',
-			columns: {},
-			indexes: {},
-			foreignKeys,
-			compositePrimaryKeys: {},
-			uniqueConstraints: {},
-			policies: {},
-			checkConstraints: {},
-			isRLSEnabled: false,
+const tableWith = (foreignKeys: Record<string, { name: string }>) =>
+	({
+		version: '7',
+		dialect: 'postgresql',
+		id: '0',
+		prevId: '0',
+		tables: {
+			'public.t': {
+				name: 't',
+				schema: '',
+				columns: {},
+				indexes: {},
+				foreignKeys,
+				compositePrimaryKeys: {},
+				uniqueConstraints: {},
+				policies: {},
+				checkConstraints: {},
+				isRLSEnabled: false,
+			},
 		},
-	},
-	enums: {},
-	schemas: {},
-	sequences: {},
-	roles: {},
-	policies: {},
-	views: {},
-	_meta: { schemas: {}, tables: {}, columns: {} },
-}) as any;
+		enums: {},
+		schemas: {},
+		sequences: {},
+		roles: {},
+		policies: {},
+		views: {},
+		_meta: { schemas: {}, tables: {}, columns: {} },
+	}) as any;
 
 test('truncatePgSchemaIdentifiers renames keys and names to the stored form', () => {
 	const long = `${'f'.repeat(70)}_fk`;

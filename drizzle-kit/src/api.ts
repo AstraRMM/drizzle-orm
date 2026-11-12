@@ -43,12 +43,7 @@ import type { Config } from './index';
 import { MySqlSchema as MySQLSchemaKit, mysqlSchema, squashMysqlScheme } from './serializer/mysqlSchema';
 import { generateMySqlSnapshot } from './serializer/mysqlSerializer';
 import { prepareFromExports } from './serializer/pgImports';
-import {
-	PgSchema as PgSchemaKit,
-	pgSchema,
-	squashPgScheme,
-	truncatePgSchemaIdentifiers,
-} from './serializer/pgSchema';
+import { PgSchema as PgSchemaKit, pgSchema, squashPgScheme, truncatePgSchemaIdentifiers } from './serializer/pgSchema';
 import { generatePgSnapshot } from './serializer/pgSerializer';
 import {
 	SingleStoreSchema as SingleStoreSchemaKit,

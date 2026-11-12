@@ -4803,7 +4803,7 @@ test('push: dropping a partial unique index does not re-create foreign keys on t
 });
 
 const longNamedTables = (withChildForeignKey: boolean) => {
-	const parent = pgTable('identifier_truncation_parent_records_with_long_names', {
+	const parent = pgTable('trunc_parent', {
 		tenantIdentifier: integer('tenant_identifier_for_partitioning').notNull(),
 		recordIdentifier: integer('record_identifier_within_the_tenant').notNull(),
 		externalReference: text('external_reference_supplied_by_the_caller').notNull(),
@@ -4814,20 +4814,22 @@ const longNamedTables = (withChildForeignKey: boolean) => {
 		index().on(t.tenantIdentifier, t.sortKey),
 		uniqueIndex().on(t.externalReference, t.sortKey),
 		check(
-			'identifier_truncation_parent_records_with_long_names_sort_key_is_positive',
+			'trunc_parent_sort_key_for_listing_records_in_order_must_be_positive',
 			sql`${t.sortKey} > 0`,
 		),
 	]);
-	const child = pgTable('identifier_truncation_child_records_with_long_names', {
+	const child = pgTable('trunc_child', {
 		id: integer('id').primaryKey(),
 		tenantIdentifier: integer('tenant_identifier_for_partitioning').notNull(),
 		recordIdentifier: integer('record_identifier_within_the_tenant').notNull(),
 	}, (t) =>
 		withChildForeignKey
-			? [foreignKey({
-				columns: [t.tenantIdentifier, t.recordIdentifier],
-				foreignColumns: [parent.tenantIdentifier, parent.recordIdentifier],
-			}).onDelete('cascade')]
+			? [
+				foreignKey({
+					columns: [t.tenantIdentifier, t.recordIdentifier],
+					foreignColumns: [parent.tenantIdentifier, parent.recordIdentifier],
+				}).onDelete('cascade'),
+			]
 			: []);
 	return { parent, child };
 };
@@ -4842,12 +4844,12 @@ test('push: indexes and constraints whose names exceed 63 bytes do not produce c
 
 	// The database really holds the truncated names the schema is compared under.
 	const { rows } = await client.query<{ name: string }>(
-		`SELECT conname AS name FROM pg_constraint WHERE conrelid::regclass::text LIKE 'identifier_truncation_%'
+		`SELECT conname AS name FROM pg_constraint WHERE conrelid::regclass::text LIKE 'trunc_%'
 		 UNION ALL
-		 SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid::regclass::text LIKE 'identifier_truncation_%'`,
+		 SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid::regclass::text LIKE 'trunc_%'`,
 	);
 	const truncated = rows.map((it) => it.name.replaceAll('"', '')).filter((it) => it.length === 63);
-	expect(truncated.length).toBeGreaterThanOrEqual(6);
+	expect(truncated.length).toBeGreaterThanOrEqual(8);
 });
 
 test('push: a new constraint with a name over 63 bytes is added under the name PostgreSQL stores, then settles', async () => {
@@ -4858,7 +4860,7 @@ test('push: a new constraint with a name over 63 bytes is added under the name P
 	const { sqlStatements } = await diffTestSchemasPush(client, before, after, [], false, ['public']);
 
 	expect(sqlStatements).toStrictEqual([
-		'ALTER TABLE "identifier_truncation_child_records_with_long_names" ADD CONSTRAINT "identifier_truncation_child_records_with_long_names_tenant_iden" FOREIGN KEY ("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") REFERENCES "public"."identifier_truncation_parent_records_with_long_names"("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") ON DELETE cascade ON UPDATE no action;',
+		'ALTER TABLE "trunc_child" ADD CONSTRAINT "trunc_child_tenant_identifier_for_partitioning_record_identifie" FOREIGN KEY ("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") REFERENCES "public"."trunc_parent"("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") ON DELETE cascade ON UPDATE no action;',
 	]);
 	for (const statement of sqlStatements) await client.exec(statement);
 
