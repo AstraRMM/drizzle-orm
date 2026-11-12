@@ -1973,7 +1973,9 @@ export const applyPgSnapshotsDiff = async (
 	}
 	for (const it of jsonDropIndexesForAllAlteredTables) {
 		const idx = action === 'push' ? PgSquasher.unsquashIdxPush(it.data) : PgSquasher.unsquashIdx(it.data);
-		if (!idx.isUnique || idx.where || idx.columns.some((column) => column.isExpression)) continue;
+		// The push format leaves out WHERE, so read it from the full previous schema.
+		const where = idx.where ?? prevFull.tables[`${it.schema || 'public'}.${it.tableName}`]?.indexes[idx.name]?.where;
+		if (!idx.isUnique || where || idx.columns.some((column) => column.isExpression)) continue;
 		droppedKeys.push({
 			schema: it.schema || 'public',
 			table: it.tableName,
@@ -1994,6 +1996,23 @@ export const applyPgSnapshotsDiff = async (
 			]),
 		]));
 		const sameColumns = (a: string[], b: string[]) => a.length === b.length && a.every((column) => b.includes(column));
+		// Whether the referenced table still has a key over these columns after this run. If it does
+		// not, re-creating the foreign key would fail after it was already dropped, so leave it in
+		// place and let the key drop fail as before.
+		const hasKeyAfter = (schema: string, tableName: string, columns: string[]) => {
+			const table = curFull.tables[`${schema}.${tableName}`];
+			if (!table) return false;
+			if (columns.length === 1) {
+				const column = table.columns[columns[0]!];
+				if (column?.primaryKey || column?.isUnique) return true;
+			}
+			return Object.values(table.compositePrimaryKeys).some((pk) => sameColumns(pk.columns, columns))
+				|| Object.values(table.uniqueConstraints).some((unique) => sameColumns(unique.columns, columns))
+				|| Object.values(table.indexes).some((index) =>
+					index.isUnique && !index.where && index.columns.every((column) => !column.isExpression)
+					&& sameColumns(index.columns.map((column) => column.expression), columns)
+				);
+		};
 
 		for (const table of Object.values(json2.tables)) {
 			const tableKey = `${table.schema || 'public'}.${table.name}`;
@@ -2007,6 +2026,7 @@ export const applyPgSnapshotsDiff = async (
 					&& sameColumns(key.columns, fk.columnsTo)
 				);
 				if (!referencesDroppedKey) continue;
+				if (!hasKeyAfter(fk.schemaTo || 'public', fk.tableTo, fk.columnsTo)) continue;
 				jsonDroppedReferencesForDroppedKeys.push(
 					...prepareDropReferencesJson(table.name, table.schema, { [fkName]: fkData }),
 				);

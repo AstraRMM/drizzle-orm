@@ -1286,12 +1286,13 @@ WHERE
       JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
       JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
         AND tc.table_name = c.table_name AND ccu.column_name = c.column_name
-      -- Key order of primary key and unique constraint columns.
-      LEFT JOIN information_schema.key_column_usage AS kcu ON kcu.constraint_schema = tc.constraint_schema
-        AND kcu.constraint_name = tc.constraint_name AND kcu.table_name = tc.table_name
-        AND kcu.column_name = c.column_name
+      -- Key order of primary key and unique constraint columns, from the catalog.
+      LEFT JOIN pg_catalog.pg_namespace AS kn ON kn.nspname = tc.constraint_schema
+      LEFT JOIN pg_catalog.pg_class AS kr ON kr.relnamespace = kn.oid AND kr.relname = tc.table_name
+      LEFT JOIN pg_catalog.pg_constraint AS kc ON kc.conrelid = kr.oid AND kc.conname = tc.constraint_name
+      LEFT JOIN pg_catalog.pg_attribute AS ka ON ka.attrelid = kr.oid AND ka.attname = c.column_name
       WHERE tc.table_name = '${tableName}' and tc.constraint_schema = '${tableSchema}'
-      ORDER BY tc.constraint_name, kcu.ordinal_position;`,
+      ORDER BY tc.constraint_name, array_position(kc.conkey, ka.attnum);`,
 					);
 
 					const tableChecks = await db.query(`SELECT 
@@ -1407,12 +1408,6 @@ WHERE
 								onUpdate,
 							};
 						}
-
-						foreignKeysToReturn[foreignKeyName].columnsFrom = [
-							...new Set(foreignKeysToReturn[foreignKeyName].columnsFrom),
-						];
-
-						foreignKeysToReturn[foreignKeyName].columnsTo = [...new Set(foreignKeysToReturn[foreignKeyName].columnsTo)];
 					}
 
 					const uniqueConstrainsRows = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'UNIQUE');

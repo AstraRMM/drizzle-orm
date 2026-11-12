@@ -4741,3 +4741,63 @@ test('push: foreign keys are re-created around a primary key, unique constraint 
 	for (const st of sqlStatements) await client.exec(st);
 	await expectDatabaseMatches(client, schema2);
 });
+
+test('generate: a foreign key is not dropped when the key it needs is removed without a replacement', async () => {
+	const parents1 = pgTable('parents', {
+		id: integer('id').primaryKey(),
+		code: text('code').notNull(),
+	}, (t) => [unique('parents_code_unique').on(t.code)]);
+	const parents2 = pgTable('parents', {
+		id: integer('id').primaryKey(),
+		code: text('code').notNull(),
+	});
+	const children = (parents: typeof parents1) =>
+		pgTable('children', {
+			id: integer('id').primaryKey(),
+			code: text('code'),
+		}, (t) => [foreignKey({ name: 'children_code_fk', columns: [t.code], foreignColumns: [parents.code] })]);
+
+	const { sqlStatements } = await diffTestSchemas(
+		{ parents: parents1, children: children(parents1) },
+		{ parents: parents2, children: children(parents2) },
+		[],
+	);
+
+	// The unique constraint is still dropped, and PostgreSQL rejects that because of the foreign key,
+	// before anything else changes. Dropping the foreign key here would leave it impossible to re-create.
+	expect(sqlStatements.some((it) => it.includes('DROP CONSTRAINT "parents_code_unique"'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('children_code_fk'))).toBe(false);
+});
+
+test('push: dropping a partial unique index does not re-create foreign keys on the same columns', async () => {
+	const client = new PGlite();
+
+	const parents = (withPartial: boolean) =>
+		pgTable('parents', {
+			id: integer('id').primaryKey(),
+			code: text('code').notNull(),
+			active: boolean('active').notNull(),
+		}, (t) => [
+			unique('parents_code_unique').on(t.code),
+			...(withPartial ? [uniqueIndex('parents_active_code_idx').on(t.code).where(sql`${t.active}`)] : []),
+		]);
+	const children = (p: ReturnType<typeof parents>) =>
+		pgTable('children', {
+			id: integer('id').primaryKey(),
+			code: text('code'),
+		}, (t) => [foreignKey({ name: 'children_code_fk', columns: [t.code], foreignColumns: [p.code] })]);
+
+	const parents1 = parents(true);
+	const parents2 = parents(false);
+	const { sqlStatements } = await diffTestSchemasPush(
+		client,
+		{ parents: parents1, children: children(parents1) },
+		{ parents: parents2, children: children(parents2) },
+		[],
+		false,
+		['public'],
+	);
+
+	expect(sqlStatements.some((it) => it.includes('DROP INDEX "parents_active_code_idx"'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('children_code_fk'))).toBe(false);
+});
