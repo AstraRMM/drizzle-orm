@@ -4801,3 +4801,69 @@ test('push: dropping a partial unique index does not re-create foreign keys on t
 	expect(sqlStatements.some((it) => it.includes('DROP INDEX "parents_active_code_idx"'))).toBe(true);
 	expect(sqlStatements.some((it) => it.includes('children_code_fk'))).toBe(false);
 });
+
+const longNamedTables = (withChildForeignKey: boolean) => {
+	const parent = pgTable('identifier_truncation_parent_records_with_long_names', {
+		tenantIdentifier: integer('tenant_identifier_for_partitioning').notNull(),
+		recordIdentifier: integer('record_identifier_within_the_tenant').notNull(),
+		externalReference: text('external_reference_supplied_by_the_caller').notNull(),
+		sortKey: integer('sort_key_for_listing_records_in_order'),
+	}, (t) => [
+		primaryKey({ columns: [t.tenantIdentifier, t.recordIdentifier] }),
+		unique().on(t.tenantIdentifier, t.externalReference),
+		index().on(t.tenantIdentifier, t.sortKey),
+		uniqueIndex().on(t.externalReference, t.sortKey),
+		check(
+			'identifier_truncation_parent_records_with_long_names_sort_key_is_positive',
+			sql`${t.sortKey} > 0`,
+		),
+	]);
+	const child = pgTable('identifier_truncation_child_records_with_long_names', {
+		id: integer('id').primaryKey(),
+		tenantIdentifier: integer('tenant_identifier_for_partitioning').notNull(),
+		recordIdentifier: integer('record_identifier_within_the_tenant').notNull(),
+	}, (t) =>
+		withChildForeignKey
+			? [foreignKey({
+				columns: [t.tenantIdentifier, t.recordIdentifier],
+				foreignColumns: [parent.tenantIdentifier, parent.recordIdentifier],
+			}).onDelete('cascade')]
+			: []);
+	return { parent, child };
+};
+
+test('push: indexes and constraints whose names exceed 63 bytes do not produce changes', async () => {
+	const client = new PGlite();
+	const schema = longNamedTables(true);
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+
+	// The database really holds the truncated names the schema is compared under.
+	const { rows } = await client.query<{ name: string }>(
+		`SELECT conname AS name FROM pg_constraint WHERE conrelid::regclass::text LIKE 'identifier_truncation_%'
+		 UNION ALL
+		 SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid::regclass::text LIKE 'identifier_truncation_%'`,
+	);
+	const truncated = rows.map((it) => it.name.replaceAll('"', '')).filter((it) => it.length === 63);
+	expect(truncated.length).toBeGreaterThanOrEqual(6);
+});
+
+test('push: a new constraint with a name over 63 bytes is added under the name PostgreSQL stores, then settles', async () => {
+	const client = new PGlite();
+	const before = longNamedTables(false);
+	const after = longNamedTables(true);
+
+	const { sqlStatements } = await diffTestSchemasPush(client, before, after, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([
+		'ALTER TABLE "identifier_truncation_child_records_with_long_names" ADD CONSTRAINT "identifier_truncation_child_records_with_long_names_tenant_iden" FOREIGN KEY ("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") REFERENCES "public"."identifier_truncation_parent_records_with_long_names"("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") ON DELETE cascade ON UPDATE no action;',
+	]);
+	for (const statement of sqlStatements) await client.exec(statement);
+
+	const second = await diffTestSchemasPush(client, after, after, [], false, ['public'], undefined, undefined, {
+		runApply: false,
+	});
+	expect(second.sqlStatements).toStrictEqual([]);
+});

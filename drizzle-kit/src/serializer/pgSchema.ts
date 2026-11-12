@@ -756,6 +756,63 @@ export const PgSquasher = {
 	},
 };
 
+// PostgreSQL stores identifiers in at most NAMEDATALEN - 1 (63) bytes and
+// silently truncates longer ones, cutting only on whole characters.
+const PG_MAX_IDENTIFIER_BYTES = 63;
+const utf8 = new TextEncoder();
+
+export function truncatePgIdentifier(name: string): string {
+	if (utf8.encode(name).length <= PG_MAX_IDENTIFIER_BYTES) return name;
+	let bytes = 0;
+	let result = '';
+	for (const char of name) {
+		bytes += utf8.encode(char).length;
+		if (bytes > PG_MAX_IDENTIFIER_BYTES) break;
+		result += char;
+	}
+	return result;
+}
+
+function truncateNamedEntries<T extends { name: string }>(
+	entries: Record<string, T>,
+	kind: string,
+	tableName: string,
+): Record<string, T> {
+	const result: Record<string, T> = {};
+	for (const [key, value] of Object.entries(entries)) {
+		const name = truncatePgIdentifier(value.name);
+		const storedKey = truncatePgIdentifier(key);
+		if (storedKey in result) {
+			throw new Error(
+				`${kind} "${key}" on table "${tableName}" has the same name as "${
+					result[storedKey]!.name
+				}" once PostgreSQL truncates it to ${PG_MAX_IDENTIFIER_BYTES} bytes ("${storedKey}"). Give one of them a shorter name.`,
+			);
+		}
+		result[storedKey] = { ...value, name };
+	}
+	return result;
+}
+
+/**
+ * Renames indexes and constraints to the names PostgreSQL actually stores, so
+ * push compares a schema against the database instead of seeing every name
+ * longer than 63 bytes as a different object to drop and re-create.
+ */
+export function truncatePgSchemaIdentifiers<T extends PgSchema>(json: T): T {
+	return {
+		...json,
+		tables: mapValues(json.tables, (table) => ({
+			...table,
+			indexes: truncateNamedEntries(table.indexes, 'Index', table.name),
+			foreignKeys: truncateNamedEntries(table.foreignKeys, 'Foreign key', table.name),
+			compositePrimaryKeys: truncateNamedEntries(table.compositePrimaryKeys, 'Primary key', table.name),
+			uniqueConstraints: truncateNamedEntries(table.uniqueConstraints, 'Unique constraint', table.name),
+			checkConstraints: truncateNamedEntries(table.checkConstraints, 'Check constraint', table.name),
+		})),
+	};
+}
+
 export const squashPgScheme = (
 	json: PgSchema,
 	action?: 'push' | undefined,
