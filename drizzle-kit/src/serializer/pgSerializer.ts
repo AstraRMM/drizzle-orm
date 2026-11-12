@@ -1288,7 +1288,13 @@ WHERE
               WHEN 'n' THEN 'SET NULL'
               WHEN 'c' THEN 'CASCADE'
               WHEN 'd' THEN 'SET DEFAULT'
-            END AS delete_rule
+            END || COALESCE((
+              SELECT ' (' || string_agg(quote_ident(delete_att.attname), ', ' ORDER BY delete_col.ordinality) || ')'
+              FROM jsonb_array_elements_text(NULLIF(to_jsonb(con)->'confdelsetcols', 'null'::jsonb))
+                WITH ORDINALITY AS delete_col(attnum, ordinality)
+              JOIN pg_catalog.pg_attribute delete_att
+                ON delete_att.attrelid = con.conrelid AND delete_att.attnum = delete_col.attnum::smallint
+            ), '') AS delete_rule
           FROM
             pg_catalog.pg_constraint con
             JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
@@ -1317,7 +1323,11 @@ WHERE
 						const schemaTo: string = fk.foreign_table_schema;
 						const foreignKeyName = fk.constraint_name;
 						const onUpdate = fk.update_rule?.toLowerCase();
-						const onDelete = fk.delete_rule?.toLowerCase();
+						// Lowercase only the action keyword; a PostgreSQL 15+ column list (`SET NULL (col)`) keeps its identifiers.
+						const onDelete = fk.delete_rule?.replace(
+							/^(NO ACTION|RESTRICT|SET NULL|CASCADE|SET DEFAULT)/,
+							(action: string) => action.toLowerCase(),
+						);
 
 						if (typeof foreignKeysToReturn[foreignKeyName] !== 'undefined') {
 							foreignKeysToReturn[foreignKeyName].columnsFrom.push(columnFrom);
@@ -1581,6 +1591,10 @@ WHERE
           pg_stat_user_indexes idx
         LEFT JOIN
           pg_constraint con ON con.conindid = idx.indexrelid
+            -- A foreign key stores the referenced index in conindid too. Only count constraints
+            -- that this index backs on its own table (primary key, unique, exclusion).
+            AND con.conrelid = idx.relid
+            AND con.contype IN ('p', 'u', 'x')
         WHERE idx.relname = '${tableName}' and schemaname = '${tableSchema}'
         group by index_name, table_name,schemaname, generated_by_constraint;`,
 					);

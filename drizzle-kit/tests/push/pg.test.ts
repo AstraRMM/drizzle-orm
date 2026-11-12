@@ -8,6 +8,7 @@ import {
 	check,
 	date,
 	doublePrecision,
+	foreignKey,
 	index,
 	integer,
 	interval,
@@ -4409,4 +4410,65 @@ test('alter inherit in role', async (t) => {
 	for (const st of sqlStatements) {
 		await client.query(st);
 	}
+});
+
+test('push: composite fk with ON DELETE SET NULL (column list) does not produce changes', async () => {
+	const client = new PGlite();
+
+	const users = pgTable('users', {
+		orgId: integer('org_id').notNull(),
+		id: integer('id').notNull(),
+	}, (t) => [primaryKey({ columns: [t.orgId, t.id] })]);
+
+	const posts = pgTable('posts', {
+		id: integer('id').primaryKey(),
+		orgId: integer('org_id').notNull(),
+		authorId: integer('author_id'),
+		editorId: integer('editorId'),
+	}, (t) => [
+		foreignKey({
+			name: 'posts_author_fk',
+			columns: [t.orgId, t.authorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set null (author_id)'),
+		foreignKey({
+			name: 'posts_editor_fk',
+			columns: [t.orgId, t.editorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set default ("editorId")'),
+	]);
+
+	const schema = { users, posts };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(statements.length).toBe(0);
+	expect(sqlStatements.length).toBe(0);
+});
+
+test('push: unique index referenced by a foreign key from another table does not produce changes', async () => {
+	const client = new PGlite();
+
+	const accounts = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+	}, (t) => [uniqueIndex('accounts_slug_idx').on(t.slug)]);
+
+	const memberships = pgTable('memberships', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+	}, (t) => [
+		foreignKey({
+			name: 'memberships_account_slug_fk',
+			columns: [t.accountSlug],
+			foreignColumns: [accounts.slug],
+		}),
+	]);
+
+	const schema = { accounts, memberships };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(statements.length).toBe(0);
+	expect(sqlStatements.length).toBe(0);
 });

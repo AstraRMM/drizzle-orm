@@ -1360,7 +1360,7 @@ const createTableFKs = (fks: ForeignKey[], schemas: Record<string, string>, casi
 
 		statement += it.onUpdate && it.onUpdate !== 'no action' ? `.onUpdate("${it.onUpdate}")` : '';
 
-		statement += it.onDelete && it.onDelete !== 'no action' ? `.onDelete("${it.onDelete}")` : '';
+		statement += it.onDelete && it.onDelete !== 'no action' ? `.onDelete(${JSON.stringify(it.onDelete)})` : '';
 
 		statement += `,`;
 	});

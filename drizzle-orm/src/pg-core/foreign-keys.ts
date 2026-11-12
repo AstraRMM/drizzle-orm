@@ -5,6 +5,19 @@ import type { PgTable } from './table.ts';
 
 export type UpdateDeleteAction = 'cascade' | 'restrict' | 'no action' | 'set null' | 'set default';
 
+/**
+ * `ON DELETE` actions. In addition to {@link UpdateDeleteAction}, PostgreSQL 15+ accepts a column list for
+ * `SET NULL` and `SET DEFAULT`, so only those columns of a composite foreign key are changed:
+ *
+ * ```ts
+ * foreignKey({ columns: [t.orgId, t.authorId], foreignColumns: [users.orgId, users.id] })
+ * 	.onDelete('set null (author_id)')
+ * ```
+ *
+ * Write the column list as it appears in SQL (quote identifiers that need it).
+ */
+export type DeleteAction = UpdateDeleteAction | `set null (${string})` | `set default (${string})`;
+
 export type Reference = () => {
 	readonly name?: string;
 	readonly columns: PgColumn[];
@@ -22,7 +35,7 @@ export class ForeignKeyBuilder {
 	_onUpdate: UpdateDeleteAction | undefined = 'no action';
 
 	/** @internal */
-	_onDelete: UpdateDeleteAction | undefined = 'no action';
+	_onDelete: DeleteAction | undefined = 'no action';
 
 	constructor(
 		config: () => {
@@ -32,7 +45,7 @@ export class ForeignKeyBuilder {
 		},
 		actions?: {
 			onUpdate?: UpdateDeleteAction;
-			onDelete?: UpdateDeleteAction;
+			onDelete?: DeleteAction;
 		} | undefined,
 	) {
 		this.reference = () => {
@@ -50,7 +63,7 @@ export class ForeignKeyBuilder {
 		return this;
 	}
 
-	onDelete(action: UpdateDeleteAction): this {
+	onDelete(action: DeleteAction): this {
 		this._onDelete = action === undefined ? 'no action' : action;
 		return this;
 	}
@@ -68,7 +81,7 @@ export class ForeignKey {
 
 	readonly reference: Reference;
 	readonly onUpdate: UpdateDeleteAction | undefined;
-	readonly onDelete: UpdateDeleteAction | undefined;
+	readonly onDelete: DeleteAction | undefined;
 
 	constructor(readonly table: PgTable, builder: ForeignKeyBuilder) {
 		this.reference = builder.reference;

@@ -9,6 +9,7 @@ import {
 	cidr,
 	date,
 	doublePrecision,
+	foreignKey,
 	index,
 	inet,
 	integer,
@@ -25,6 +26,7 @@ import {
 	pgSchema,
 	pgTable,
 	pgView,
+	primaryKey,
 	real,
 	serial,
 	smallint,
@@ -32,6 +34,7 @@ import {
 	text,
 	time,
 	timestamp,
+	uniqueIndex,
 	uuid,
 	varchar,
 } from 'drizzle-orm/pg-core';
@@ -925,4 +928,76 @@ test('multiple policies with roles from schema', async () => {
 
 	expect(statements.length).toBe(0);
 	expect(sqlStatements.length).toBe(0);
+});
+
+test('introspect composite fk with ON DELETE SET NULL / SET DEFAULT column lists', async () => {
+	const client = new PGlite();
+
+	const users = pgTable('users', {
+		orgId: integer('org_id').notNull(),
+		id: integer('id').notNull(),
+	}, (t) => [primaryKey({ columns: [t.orgId, t.id] })]);
+
+	const posts = pgTable('posts', {
+		id: integer('id').primaryKey(),
+		orgId: integer('org_id').notNull(),
+		authorId: integer('author_id'),
+		editorId: integer('editorId'),
+	}, (t) => [
+		foreignKey({
+			name: 'posts_author_fk',
+			columns: [t.orgId, t.authorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set null (author_id)'),
+		foreignKey({
+			name: 'posts_editor_fk',
+			columns: [t.orgId, t.editorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set default ("editorId")'),
+	]);
+
+	const { statements, sqlStatements } = await introspectPgToFile(
+		client,
+		{ users, posts },
+		'introspect-fk-delete-column-list',
+	);
+
+	expect(statements.length).toBe(0);
+	expect(sqlStatements.length).toBe(0);
+
+	const file = fs.readFileSync('tests/introspect/postgres/introspect-fk-delete-column-list.ts', 'utf8');
+	expect(file).toContain('.onDelete("set null (author_id)")');
+	expect(file).toContain('.onDelete("set default (\\"editorId\\")")');
+});
+
+test('introspect keeps a unique index referenced by another table\'s foreign key', async () => {
+	const client = new PGlite();
+
+	const accounts = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+	}, (t) => [uniqueIndex('accounts_slug_idx').on(t.slug)]);
+
+	const memberships = pgTable('memberships', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+	}, (t) => [
+		foreignKey({
+			name: 'memberships_account_slug_fk',
+			columns: [t.accountSlug],
+			foreignColumns: [accounts.slug],
+		}),
+	]);
+
+	const { statements, sqlStatements } = await introspectPgToFile(
+		client,
+		{ accounts, memberships },
+		'introspect-referenced-unique-index',
+	);
+
+	expect(statements.length).toBe(0);
+	expect(sqlStatements.length).toBe(0);
+
+	const file = fs.readFileSync('tests/introspect/postgres/introspect-referenced-unique-index.ts', 'utf8');
+	expect(file).toContain('uniqueIndex("accounts_slug_idx")');
 });
