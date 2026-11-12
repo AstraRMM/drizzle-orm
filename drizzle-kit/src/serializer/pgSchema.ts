@@ -599,7 +599,11 @@ export const PgSquasher = {
 		index.parse(idx);
 		return `${idx.name};${
 			idx.columns
-				.map((c) => `${c.isExpression ? '' : c.expression}--${c.asc}--${c.nulls}`)
+				.map((c) => {
+					// Ordering written inside a raw SQL expression is the column's real ordering.
+					const { asc, nulls } = c.isExpression ? expressionOrdering(c) : c;
+					return `${c.isExpression ? '' : c.expression}--${asc}--${nulls}`;
+				})
 				.join(',,')
 		};${idx.isUnique};${idx.method};${JSON.stringify(idx.with)}`;
 	},
@@ -862,11 +866,7 @@ function comparablePushDefault(value: unknown, type: string): string | undefined
 	return current;
 }
 
-const trailingOrdering = /\s+(asc|desc)(?:\s+nulls\s+(first|last))?\s*$|\s+nulls\s+(first|last)\s*$/i;
-
-/** An index column in a form where raw SQL ordering and bare column references compare equal. */
-function comparablePushIndexColumn(column: Index['columns'][number]) {
-	if (!column.isExpression) return `${column.expression}--${column.asc}--${column.nulls}`;
+function expressionOrdering(column: Index['columns'][number]) {
 	let expression = column.expression.trim();
 	let { asc, nulls } = column;
 	const ordering = trailingOrdering.exec(expression);
@@ -875,6 +875,15 @@ function comparablePushIndexColumn(column: Index['columns'][number]) {
 		asc = ordering[1]?.toLowerCase() !== 'desc';
 		nulls = ((ordering[2] ?? ordering[3])?.toLowerCase() as typeof nulls) ?? (asc ? 'last' : 'first');
 	}
+	return { expression, asc, nulls };
+}
+
+const trailingOrdering = /\s+(asc|desc)(?:\s+nulls\s+(first|last))?\s*$|\s+nulls\s+(first|last)\s*$/i;
+
+/** An index column in a form where raw SQL ordering and bare column references compare equal. */
+function comparablePushIndexColumn(column: Index['columns'][number]) {
+	if (!column.isExpression) return `${column.expression}--${column.asc}--${column.nulls}`;
+	const { expression, asc, nulls } = expressionOrdering(column);
 	// PostgreSQL stores an expression that is only a column reference as that plain column.
 	const bare = /^(?:"([^"]+)"|([a-z_][a-z0-9_$]*))$/.exec(stripWrappingParens(expression));
 	return `${bare ? bare[1] ?? bare[2] : ''}--${asc}--${nulls}`;
