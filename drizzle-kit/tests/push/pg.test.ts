@@ -4638,3 +4638,93 @@ test('push: composite foreign key whose columns are not in table order does not 
 	expect(sqlStatements).toStrictEqual([]);
 	expect(statements.length).toBe(0);
 });
+
+function keysReferencedByForeignKeys(version: 1 | 2) {
+	const parents = pgTable('parents', {
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		code: text('code').notNull(),
+		slug: text('slug').notNull(),
+	}, (t) => [
+		// The primary key changes column order, the unique constraint changes NULLS NOT DISTINCT and
+		// the unique index is renamed. Each is dropped and re-created while a foreign key needs it.
+		primaryKey({ name: 'parents_pk', columns: version === 1 ? [t.x, t.y] : [t.y, t.x] }),
+		version === 1
+			? unique('parents_code_unique').on(t.code)
+			: unique('parents_code_unique').on(t.code).nullsNotDistinct(),
+		uniqueIndex(version === 1 ? 'parents_slug_idx' : 'parents_slug_uidx').on(t.slug),
+	]);
+
+	const others = pgTable('others', { id: integer('id').primaryKey() });
+
+	const children = pgTable('children', {
+		id: integer('id').primaryKey(),
+		a: integer('a'),
+		b: integer('b'),
+		code: text('code'),
+		slug: text('slug'),
+		otherId: integer('other_id'),
+	}, (t) => [
+		foreignKey({ name: 'children_pk_fk', columns: [t.a, t.b], foreignColumns: [parents.x, parents.y] }),
+		foreignKey({ name: 'children_code_fk', columns: [t.code], foreignColumns: [parents.code] }),
+		foreignKey({ name: 'children_slug_fk', columns: [t.slug], foreignColumns: [parents.slug] }),
+		foreignKey({ name: 'children_other_fk', columns: [t.otherId], foreignColumns: [others.id] }),
+	]);
+
+	return { parents, others, children };
+}
+
+test('generate: foreign keys are re-created around a primary key, unique constraint or unique index that is re-created', async () => {
+	const client = new PGlite();
+	const schema1 = keysReferencedByForeignKeys(1);
+	const schema2 = keysReferencedByForeignKeys(2);
+
+	const { sqlStatements: initial } = await diffTestSchemas({}, schema1, []);
+	for (const st of initial) await client.query(st);
+
+	const { sqlStatements } = await diffTestSchemas(schema1, schema2, []);
+
+	const at = (pattern: string) => sqlStatements.findIndex((it) => it.includes(pattern));
+	for (const fk of ['children_pk_fk', 'children_code_fk', 'children_slug_fk']) {
+		const dropAt = sqlStatements.findIndex((it) => it.includes(`DROP CONSTRAINT "${fk}"`));
+		const addAt = sqlStatements.findIndex((it) => it.includes(`ADD CONSTRAINT "${fk}"`));
+		expect(dropAt).toBeGreaterThanOrEqual(0);
+		expect(dropAt).toBeLessThan(at('DROP CONSTRAINT "parents_pk"'));
+		expect(dropAt).toBeLessThan(at('DROP CONSTRAINT "parents_code_unique"'));
+		expect(dropAt).toBeLessThan(at('DROP INDEX'));
+		expect(addAt).toBeGreaterThan(at('PRIMARY KEY("y","x")'));
+		expect(addAt).toBeGreaterThan(at('"parents_code_unique" UNIQUE NULLS NOT DISTINCT'));
+		expect(addAt).toBeGreaterThan(at('CREATE UNIQUE INDEX "parents_slug_uidx"'));
+	}
+	// A foreign key to an unchanged key is left alone.
+	expect(sqlStatements.some((it) => it.includes('children_other_fk'))).toBe(false);
+
+	for (const st of sqlStatements) await client.query(st);
+
+	// The database now matches schema 2.
+	const { sqlStatements: after } = await diffTestSchemasPush(client, schema2, schema2, [], false, ['public'], undefined, undefined, {
+		runApply: false,
+	});
+	expect(after).toStrictEqual([]);
+});
+
+test('push: foreign keys are re-created around a primary key, unique constraint or unique index that is re-created', async () => {
+	const client = new PGlite();
+	const schema1 = keysReferencedByForeignKeys(1);
+	const schema2 = keysReferencedByForeignKeys(2);
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema1, schema2, [], false, ['public']);
+
+	for (const fk of ['children_pk_fk', 'children_code_fk', 'children_slug_fk']) {
+		expect(sqlStatements.some((it) => it.includes(`DROP CONSTRAINT "${fk}"`))).toBe(true);
+		expect(sqlStatements.some((it) => it.includes(`ADD CONSTRAINT "${fk}"`))).toBe(true);
+	}
+	expect(sqlStatements.some((it) => it.includes('children_other_fk'))).toBe(false);
+
+	for (const st of sqlStatements) await client.query(st);
+
+	const { sqlStatements: after } = await diffTestSchemasPush(client, schema2, schema2, [], false, ['public'], undefined, undefined, {
+		runApply: false,
+	});
+	expect(after).toStrictEqual([]);
+});

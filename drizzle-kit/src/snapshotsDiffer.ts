@@ -34,6 +34,7 @@ import {
 	JsonCreatePgViewStatement,
 	JsonCreatePolicyStatement,
 	JsonCreateReferenceStatement,
+	JsonDeleteReferenceStatement,
 	JsonCreateSqliteViewStatement,
 	JsonCreateUniqueConstraint,
 	JsonDeleteCheckConstraint,
@@ -1945,6 +1946,77 @@ export const applyPgSnapshotsDiff = async (
 		}
 	}
 
+	// PostgreSQL will not drop a primary key, unique constraint or unique index while a foreign key
+	// depends on it. When one is dropped (or dropped and re-created, e.g. renamed), drop the existing
+	// foreign keys that reference its columns first and re-create them once the new key exists.
+	const droppedKeys: { schema: string; table: string; columns: string[] }[] = [];
+	for (const it of jsonDeletedCompositePKs) {
+		droppedKeys.push({
+			schema: it.schema || 'public',
+			table: it.tableName,
+			columns: PgSquasher.unsquashPK(it.data).columns,
+		});
+	}
+	for (const it of jsonAlteredCompositePKs) {
+		droppedKeys.push({
+			schema: it.schema || 'public',
+			table: it.tableName,
+			columns: PgSquasher.unsquashPK(it.old).columns,
+		});
+	}
+	for (const it of jsonDeletedUniqueConstraints) {
+		droppedKeys.push({
+			schema: it.schema || 'public',
+			table: it.tableName,
+			columns: PgSquasher.unsquashUnique(it.data).columns,
+		});
+	}
+	for (const it of jsonDropIndexesForAllAlteredTables) {
+		const idx = action === 'push' ? PgSquasher.unsquashIdxPush(it.data) : PgSquasher.unsquashIdx(it.data);
+		if (!idx.isUnique || idx.where || idx.columns.some((column) => column.isExpression)) continue;
+		droppedKeys.push({
+			schema: it.schema || 'public',
+			table: it.tableName,
+			columns: idx.columns.map((column) => column.expression),
+		});
+	}
+
+	const jsonDroppedReferencesForDroppedKeys: JsonDeleteReferenceStatement[] = [];
+	const jsonCreatedReferencesForDroppedKeys: JsonCreateReferenceStatement[] = [];
+	if (droppedKeys.length > 0) {
+		const createdTableKeys = new Set(createdTables.map((it) => `${it.schema || 'public'}.${it.name}`));
+		const changedForeignKeys = new Map(alteredTables.map((it) => [
+			`${it.schema || 'public'}.${it.name}`,
+			new Set([
+				...Object.keys(it.addedForeignKeys),
+				...Object.keys(it.deletedForeignKeys),
+				...Object.keys(it.alteredForeignKeys),
+			]),
+		]));
+		const sameColumns = (a: string[], b: string[]) => a.length === b.length && a.every((column) => b.includes(column));
+
+		for (const table of Object.values(json2.tables)) {
+			const tableKey = `${table.schema || 'public'}.${table.name}`;
+			if (createdTableKeys.has(tableKey)) continue;
+			const changed = changedForeignKeys.get(tableKey);
+			for (const [fkName, fkData] of Object.entries(table.foreignKeys)) {
+				if (changed?.has(fkName)) continue;
+				const fk = PgSquasher.unsquashFK(fkData);
+				const referencesDroppedKey = droppedKeys.some((key) =>
+					key.schema === (fk.schemaTo || 'public') && key.table === fk.tableTo
+					&& sameColumns(key.columns, fk.columnsTo)
+				);
+				if (!referencesDroppedKey) continue;
+				jsonDroppedReferencesForDroppedKeys.push(
+					...prepareDropReferencesJson(table.name, table.schema, { [fkName]: fkData }),
+				);
+				jsonCreatedReferencesForDroppedKeys.push(
+					...prepareCreateReferencesJson(table.name, table.schema, { [fkName]: fkData }),
+				);
+			}
+		}
+	}
+
 	jsonStatements.push(...createSchemas);
 	jsonStatements.push(...renameSchemas);
 	jsonStatements.push(...createEnums);
@@ -1975,10 +2047,12 @@ export const applyPgSnapshotsDiff = async (
 	jsonStatements.push(...jsonRenameTables);
 	jsonStatements.push(...jsonRenameColumnsStatements);
 
+	// Foreign keys are dropped before the keys they may depend on.
+	jsonStatements.push(...jsonDroppedReferencesForAlteredTables);
+	jsonStatements.push(...jsonDroppedReferencesForDroppedKeys);
+
 	jsonStatements.push(...jsonDeletedUniqueConstraints);
 	jsonStatements.push(...jsonDeletedCheckConstraints);
-
-	jsonStatements.push(...jsonDroppedReferencesForAlteredTables);
 
 	jsonStatements.push(...jsonAlterEnumsWithDroppedValues);
 
@@ -2006,6 +2080,7 @@ export const applyPgSnapshotsDiff = async (
 	// created above, and PostgreSQL rejects it if that index does not exist yet.
 	jsonStatements.push(...jsonCreateReferencesForCreatedTables);
 	jsonStatements.push(...jsonCreatedReferencesForAlteredTables);
+	jsonStatements.push(...jsonCreatedReferencesForDroppedKeys);
 
 	jsonStatements.push(...createViews);
 
