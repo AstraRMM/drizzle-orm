@@ -13,7 +13,9 @@ test('normalizePgDeleteAction quotes every column and folds unquoted names', () 
 	expect(normalizePgDeleteAction('set null ("author_id")')).toBe('set null ("author_id")');
 	expect(normalizePgDeleteAction('SET NULL (Author_Id,"editorId")')).toBe('set null ("author_id", "editorId")');
 	expect(normalizePgDeleteAction('set  default(  b ,  a )')).toBe('set default ("b", "a")');
-	expect(normalizePgDeleteAction('set null ("we""ird, name", position)')).toBe('set null ("we""ird, name", "position")');
+	expect(normalizePgDeleteAction('set null ("we""ird, name", position)')).toBe(
+		'set null ("we""ird, name", "position")',
+	);
 });
 
 test('normalizePgDeleteAction returns lists it cannot parse unchanged', () => {
