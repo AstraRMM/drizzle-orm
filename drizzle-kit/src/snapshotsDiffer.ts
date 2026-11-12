@@ -1991,10 +1991,7 @@ export const applyPgSnapshotsDiff = async (
 	jsonStatements.push(...jsonAddedCompositePKs);
 	jsonStatements.push(...jsonAddColumnsStatemets);
 
-	jsonStatements.push(...jsonCreateReferencesForCreatedTables);
 	jsonStatements.push(...jsonCreateIndexesForCreatedTables);
-
-	jsonStatements.push(...jsonCreatedReferencesForAlteredTables);
 	jsonStatements.push(...jsonCreateIndexesFoAlteredTables);
 
 	jsonStatements.push(...jsonDropColumnsStatemets);
@@ -2004,6 +2001,11 @@ export const applyPgSnapshotsDiff = async (
 	jsonStatements.push(...jsonCreatedCheckConstraints);
 
 	jsonStatements.push(...jsonAlteredUniqueConstraints);
+
+	// Foreign keys go last: a foreign key can target a unique index or unique constraint
+	// created above, and PostgreSQL rejects it if that index does not exist yet.
+	jsonStatements.push(...jsonCreateReferencesForCreatedTables);
+	jsonStatements.push(...jsonCreatedReferencesForAlteredTables);
 
 	jsonStatements.push(...createViews);
 

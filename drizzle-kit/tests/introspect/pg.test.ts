@@ -1001,3 +1001,22 @@ async function introspectPublicSchema(client: PGlite) {
 		['public'],
 	);
 }
+
+test('introspect pairs composite foreign key columns in key order', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "parents" ("x" integer NOT NULL, "y" integer NOT NULL, PRIMARY KEY ("x", "y"));
+		CREATE TABLE "children" (
+			"id" integer PRIMARY KEY NOT NULL,
+			"a" integer,
+			"b" integer,
+			CONSTRAINT "children_parent_fk" FOREIGN KEY ("b", "a") REFERENCES "parents"("x", "y")
+		);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	const fk = introspected.tables['public.children']!.foreignKeys['children_parent_fk']!;
+	expect(fk.columnsFrom).toStrictEqual(['b', 'a']);
+	expect(fk.columnsTo).toStrictEqual(['x', 'y']);
+});

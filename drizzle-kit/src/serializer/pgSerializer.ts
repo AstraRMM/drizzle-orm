@@ -1352,16 +1352,19 @@ WHERE
             pg_catalog.pg_constraint con
             JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
             JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace
-            LEFT JOIN pg_catalog.pg_attribute att ON att.attnum = ANY (con.conkey)
+            -- Pair each key column with the column it references, in key order.
+            CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS fk_col(attnum, fattnum, ordinality)
+            LEFT JOIN pg_catalog.pg_attribute att ON att.attnum = fk_col.attnum
               AND att.attrelid = con.conrelid
             LEFT JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid
             LEFT JOIN pg_catalog.pg_namespace fnsp ON fnsp.oid = frel.relnamespace
-            LEFT JOIN pg_catalog.pg_attribute fatt ON fatt.attnum = ANY (con.confkey)
+            LEFT JOIN pg_catalog.pg_attribute fatt ON fatt.attnum = fk_col.fattnum
               AND fatt.attrelid = con.confrelid
           WHERE
             nsp.nspname = '${tableSchema}'
             AND rel.relname = '${tableName}'
-            AND con.contype IN ('f');`,
+            AND con.contype IN ('f')
+          ORDER BY con.conname, fk_col.ordinality;`,
 					);
 
 					foreignKeysCount += tableForeignKeys.length;

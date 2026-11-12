@@ -4468,29 +4468,10 @@ test('push: unique index referenced by a foreign key from another table does not
 
 	const schema = { accounts, memberships };
 
-	// Created by hand: the generated DDL adds foreign keys before indexes, so the referenced
-	// unique index would not exist yet when the foreign key is added.
-	const { statements, sqlStatements } = await diffTestSchemasPush(
-		client,
-		schema,
-		schema,
-		[],
-		false,
-		['public'],
-		undefined,
-		undefined,
-		{
-			before: [
-				'CREATE TABLE "accounts" ("id" integer PRIMARY KEY NOT NULL, "slug" text NOT NULL);',
-				'CREATE UNIQUE INDEX "accounts_slug_idx" ON "accounts" USING btree ("slug");',
-				'CREATE TABLE "memberships" ("id" integer PRIMARY KEY NOT NULL, "account_slug" text NOT NULL, CONSTRAINT "memberships_account_slug_fk" FOREIGN KEY ("account_slug") REFERENCES "accounts"("slug"));',
-			],
-			runApply: false,
-		},
-	);
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
 
+	expect(sqlStatements).toStrictEqual([]);
 	expect(statements.length).toBe(0);
-	expect(sqlStatements.length).toBe(0);
 });
 
 test('push: ON DELETE SET NULL column lists compare by column, not by spelling', async () => {
@@ -4570,24 +4551,89 @@ test('push: unique index referenced by a self-referencing foreign key does not p
 
 	const schema = { nodes };
 
-	const { statements, sqlStatements } = await diffTestSchemasPush(
-		client,
-		schema,
-		schema,
-		[],
-		false,
-		['public'],
-		undefined,
-		undefined,
-		{
-			before: [
-				'CREATE TABLE "nodes" ("id" integer PRIMARY KEY NOT NULL, "slug" text NOT NULL, "parent_slug" text);',
-				'CREATE UNIQUE INDEX "nodes_slug_idx" ON "nodes" USING btree ("slug");',
-				'ALTER TABLE "nodes" ADD CONSTRAINT "nodes_parent_slug_fk" FOREIGN KEY ("parent_slug") REFERENCES "nodes"("slug");',
-			],
-			runApply: false,
-		},
-	);
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
+});
+
+test('generate: foreign keys are created after the unique index and unique constraint they reference', async () => {
+	const client = new PGlite();
+
+	const accounts1 = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+		code: text('code').notNull(),
+	});
+
+	const members1 = pgTable('members', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+		accountCode: text('account_code').notNull(),
+	});
+
+	const accounts2 = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+		code: text('code').notNull(),
+	}, (t) => [uniqueIndex('accounts_slug_idx').on(t.slug), unique('accounts_code_unique').on(t.code)]);
+
+	const members2 = pgTable('members', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+		accountCode: text('account_code').notNull(),
+	}, (t) => [
+		foreignKey({ name: 'members_slug_fk', columns: [t.accountSlug], foreignColumns: [accounts2.slug] }),
+		foreignKey({ name: 'members_code_fk', columns: [t.accountCode], foreignColumns: [accounts2.code] }),
+	]);
+
+	// Existing tables gain the unique index, the unique constraint and the foreign keys in one step.
+	const altered = await diffTestSchemas({ accounts: accounts1, members: members1 }, {
+		accounts: accounts2,
+		members: members2,
+	}, []);
+	// New tables get everything at once.
+	const created = await diffTestSchemas({}, { accounts: accounts2, members: members2 }, []);
+
+	for (const { sqlStatements } of [altered, created]) {
+		const fkAt = sqlStatements.findIndex((it) => it.includes('"members_slug_fk"'));
+		const indexAt = sqlStatements.findIndex((it) => it.includes('"accounts_slug_idx"'));
+		const uniqueAt = sqlStatements.findIndex((it) => it.includes('"accounts_code_unique"'));
+		expect(fkAt).toBeGreaterThan(indexAt);
+		expect(fkAt).toBeGreaterThan(uniqueAt);
+	}
+
+	const { sqlStatements: initial } = await diffTestSchemas({}, { accounts: accounts1, members: members1 }, []);
+	for (const st of [...initial, ...altered.sqlStatements]) {
+		await client.query(st);
+	}
+
+	const fresh = new PGlite();
+	for (const st of created.sqlStatements) {
+		await fresh.query(st);
+	}
+});
+
+test('push: composite foreign key whose columns are not in table order does not produce changes', async () => {
+	const client = new PGlite();
+
+	const parents = pgTable('parents', {
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+	}, (t) => [primaryKey({ columns: [t.x, t.y] })]);
+
+	const children = pgTable('children', {
+		id: integer('id').primaryKey(),
+		a: integer('a'),
+		b: integer('b'),
+	}, (t) => [
+		// b -> x and a -> y; introspection used to pair a -> x and b -> y.
+		foreignKey({ name: 'children_parent_fk', columns: [t.b, t.a], foreignColumns: [parents.x, parents.y] }),
+	]);
+
+	const schema = { parents, children };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
 
 	expect(sqlStatements).toStrictEqual([]);
 	expect(statements.length).toBe(0);
