@@ -30,6 +30,7 @@ import {
 	text,
 	time,
 	timestamp,
+	unique,
 	uniqueIndex,
 	uuid,
 	varchar,
@@ -4490,4 +4491,104 @@ test('push: unique index referenced by a foreign key from another table does not
 
 	expect(statements.length).toBe(0);
 	expect(sqlStatements.length).toBe(0);
+});
+
+test('push: ON DELETE SET NULL column lists compare by column, not by spelling', async () => {
+	const client = new PGlite();
+
+	const parents = pgTable('parents', {
+		orgId: integer('org_id').notNull(),
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+	}, (t) => [
+		primaryKey({ columns: [t.orgId, t.x, t.y] }),
+		unique('parents_org_x_unique').on(t.orgId, t.x),
+	]);
+
+	const children = pgTable('children', {
+		id: integer('id').primaryKey(),
+		orgId: integer('org_id').notNull(),
+		a: integer('a'),
+		b: integer('b'),
+		position: integer('position'),
+	}, (t) => [
+		// `position` is a keyword that quote_ident() quotes although it is legal unquoted here.
+		foreignKey({
+			name: 'children_position_fk',
+			columns: [t.orgId, t.position],
+			foreignColumns: [parents.orgId, parents.x],
+		}).onDelete('set null (position)'),
+		// Two columns, listed in a different order from the table, with odd spacing and case.
+		foreignKey({
+			name: 'children_ab_fk',
+			columns: [t.orgId, t.a, t.b],
+			foreignColumns: [parents.orgId, parents.x, parents.y],
+		}).onDelete('SET NULL (B,"a")'),
+	]);
+
+	const schema = { parents, children };
+
+	// Composite FKs that target a composite primary key are created by hand so that the
+	// referenced constraint exists first.
+	const { statements, sqlStatements } = await diffTestSchemasPush(
+		client,
+		schema,
+		schema,
+		[],
+		false,
+		['public'],
+		undefined,
+		undefined,
+		{
+			before: [
+				'CREATE TABLE "parents" ("org_id" integer NOT NULL, "x" integer NOT NULL, "y" integer NOT NULL, CONSTRAINT "parents_org_id_x_y_pk" PRIMARY KEY ("org_id", "x", "y"), CONSTRAINT "parents_org_x_unique" UNIQUE ("org_id", "x"));',
+				'CREATE TABLE "children" ("id" integer PRIMARY KEY NOT NULL, "org_id" integer NOT NULL, "a" integer, "b" integer, "position" integer, CONSTRAINT "children_position_fk" FOREIGN KEY ("org_id", "position") REFERENCES "parents"("org_id", "x") ON DELETE SET NULL (position), CONSTRAINT "children_ab_fk" FOREIGN KEY ("org_id", "a", "b") REFERENCES "parents"("org_id", "x", "y") ON DELETE SET NULL (b, a));',
+			],
+			runApply: false,
+		},
+	);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
+});
+
+test('push: unique index referenced by a self-referencing foreign key does not produce changes', async () => {
+	const client = new PGlite();
+
+	const nodes = pgTable('nodes', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+		parentSlug: text('parent_slug'),
+	}, (t) => [
+		uniqueIndex('nodes_slug_idx').on(t.slug),
+		foreignKey({
+			name: 'nodes_parent_slug_fk',
+			columns: [t.parentSlug],
+			foreignColumns: [t.slug],
+		}),
+	]);
+
+	const schema = { nodes };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(
+		client,
+		schema,
+		schema,
+		[],
+		false,
+		['public'],
+		undefined,
+		undefined,
+		{
+			before: [
+				'CREATE TABLE "nodes" ("id" integer PRIMARY KEY NOT NULL, "slug" text NOT NULL, "parent_slug" text);',
+				'CREATE UNIQUE INDEX "nodes_slug_idx" ON "nodes" USING btree ("slug");',
+				'ALTER TABLE "nodes" ADD CONSTRAINT "nodes_parent_slug_fk" FOREIGN KEY ("parent_slug") REFERENCES "nodes"("slug");',
+			],
+			runApply: false,
+		},
+	);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
 });

@@ -14,7 +14,9 @@ export type UpdateDeleteAction = 'cascade' | 'restrict' | 'no action' | 'set nul
  * 	.onDelete('set null (author_id)')
  * ```
  *
- * Write the column list as it appears in SQL (quote identifiers that need it).
+ * The column list is passed to SQL as written, so use database column names (not TypeScript keys,
+ * which matters with `casing`) and quote names that need it, as in SQL. drizzle-kit compares lists
+ * after normalizing them, so `set null (author_id)` and `set null ("author_id")` are the same action.
  */
 export type DeleteAction = UpdateDeleteAction | `set null (${string})` | `set default (${string})`;
 

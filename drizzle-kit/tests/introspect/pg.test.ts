@@ -34,7 +34,6 @@ import {
 	text,
 	time,
 	timestamp,
-	uniqueIndex,
 	uuid,
 	varchar,
 } from 'drizzle-orm/pg-core';
@@ -968,7 +967,7 @@ test('introspect composite fk with ON DELETE SET NULL / SET DEFAULT column lists
 
 	const introspected = await introspectPublicSchema(client);
 	const foreignKeys = introspected.tables['public.posts']!.foreignKeys;
-	expect(foreignKeys['posts_author_fk']!.onDelete).toBe('set null (author_id)');
+	expect(foreignKeys['posts_author_fk']!.onDelete).toBe('set null ("author_id")');
 	expect(foreignKeys['posts_editor_fk']!.onDelete).toBe('set default ("editorId")');
 });
 

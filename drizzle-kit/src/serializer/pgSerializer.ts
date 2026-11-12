@@ -43,6 +43,59 @@ import type {
 import { type DB, escapeSingleQuotes, isPgArrayType } from '../utils';
 import { getColumnCasing, sqlToStr } from './utils';
 
+/**
+ * Brings an `ON DELETE` action to one spelling so the schema and the database compare equal.
+ * PostgreSQL 15+ column lists (`set null (a, b)`) are rewritten with every column quoted and
+ * unquoted names folded to lower case, the way PostgreSQL resolves them:
+ * `SET NULL (Author_Id,"editorId")` becomes `set null ("author_id", "editorId")`.
+ * Other actions, and lists that cannot be parsed, are returned unchanged.
+ */
+export function normalizePgDeleteAction(action: string | undefined): string | undefined {
+	if (action === undefined) return action;
+	const match = /^\s*(set\s+null|set\s+default)\s*\((.*)\)\s*$/is.exec(action);
+	if (!match) return action;
+
+	const names: string[] = [];
+	const list = match[2]!;
+	let i = 0;
+	while (i < list.length) {
+		while (i < list.length && /\s/.test(list[i]!)) i++;
+		let name = '';
+		if (list[i] === '"') {
+			i++;
+			for (;;) {
+				if (i >= list.length) return action;
+				if (list[i] === '"') {
+					if (list[i + 1] === '"') {
+						name += '"';
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				name += list[i++];
+			}
+			while (i < list.length && /\s/.test(list[i]!)) i++;
+		} else {
+			const start = i;
+			while (i < list.length && list[i] !== ',') i++;
+			name = list.slice(start, i).trim().toLowerCase();
+			if (name === '' || /[\s"]/.test(name)) return action;
+		}
+		names.push(name);
+		if (i < list.length) {
+			if (list[i] !== ',') return action;
+			i++;
+			if (i >= list.length) return action;
+		}
+	}
+	if (names.length === 0) return action;
+
+	const keyword = match[1]!.toLowerCase().replace(/\s+/g, ' ');
+	return `${keyword} (${names.map((name) => `"${name.replace(/"/g, '""')}"`).join(', ')})`;
+}
+
 export const indexName = (tableName: string, columns: string[]) => {
 	return `${tableName}_${columns.join('_')}_index`;
 };
@@ -324,7 +377,7 @@ export const generatePgSnapshot = (
 
 		const fks: ForeignKey[] = foreignKeys.map((fk) => {
 			const tableFrom = tableName;
-			const onDelete = fk.onDelete;
+			const onDelete = normalizePgDeleteAction(fk.onDelete);
 			const onUpdate = fk.onUpdate;
 			const reference = fk.reference();
 
@@ -1324,9 +1377,11 @@ WHERE
 						const foreignKeyName = fk.constraint_name;
 						const onUpdate = fk.update_rule?.toLowerCase();
 						// Lowercase only the action keyword; a PostgreSQL 15+ column list (`SET NULL (col)`) keeps its identifiers.
-						const onDelete = fk.delete_rule?.replace(
-							/^(NO ACTION|RESTRICT|SET NULL|CASCADE|SET DEFAULT)/,
-							(action: string) => action.toLowerCase(),
+						const onDelete = normalizePgDeleteAction(
+							fk.delete_rule?.replace(
+								/^(NO ACTION|RESTRICT|SET NULL|CASCADE|SET DEFAULT)/,
+								(action: string) => action.toLowerCase(),
+							),
 						);
 
 						if (typeof foreignKeysToReturn[foreignKeyName] !== 'undefined') {
