@@ -1281,12 +1281,17 @@ WHERE
 					const tableResponse = await getColumnsInfoQuery({ schema: tableSchema, table: tableName, db });
 
 					const tableConstraints = await db.query(
-						`SELECT c.column_name, c.data_type, constraint_type, constraint_name, constraint_schema
+						`SELECT c.column_name, c.data_type, tc.constraint_type, tc.constraint_name, tc.constraint_schema
       FROM information_schema.table_constraints tc
       JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
       JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
         AND tc.table_name = c.table_name AND ccu.column_name = c.column_name
-      WHERE tc.table_name = '${tableName}' and constraint_schema = '${tableSchema}';`,
+      -- Key order of primary key and unique constraint columns.
+      LEFT JOIN information_schema.key_column_usage AS kcu ON kcu.constraint_schema = tc.constraint_schema
+        AND kcu.constraint_name = tc.constraint_name AND kcu.table_name = tc.table_name
+        AND kcu.column_name = c.column_name
+      WHERE tc.table_name = '${tableName}' and tc.constraint_schema = '${tableSchema}'
+      ORDER BY tc.constraint_name, kcu.ordinal_position;`,
 					);
 
 					const tableChecks = await db.query(`SELECT 
@@ -1412,6 +1417,22 @@ WHERE
 
 					const uniqueConstrainsRows = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'UNIQUE');
 
+					// NULLS NOT DISTINCT (PostgreSQL 15+) lives on the index behind the constraint. Read it
+					// through to_jsonb so older servers, which have no such column, still work.
+					const uniqueNullsNotDistinct = new Set(
+						uniqueConstrainsRows.length === 0 ? [] : (await db.query(
+							`SELECT con.conname AS constraint_name
+              FROM pg_catalog.pg_constraint con
+              JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+              JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+              JOIN pg_catalog.pg_index idx ON idx.indexrelid = con.conindid
+              WHERE con.contype = 'u'
+                AND nsp.nspname = '${tableSchema}'
+                AND rel.relname = '${tableName}'
+                AND COALESCE((to_jsonb(idx)->>'indnullsnotdistinct')::boolean, false);`,
+						)).map((row: { constraint_name: string }) => row.constraint_name),
+					);
+
 					for (const unqs of uniqueConstrainsRows) {
 						// const tableFrom = fk.table_name;
 						const columnName: string = unqs.column_name;
@@ -1422,7 +1443,7 @@ WHERE
 						} else {
 							uniqueConstrains[constraintName] = {
 								columns: [columnName],
-								nullsNotDistinct: false,
+								nullsNotDistinct: uniqueNullsNotDistinct.has(constraintName),
 								name: constraintName,
 							};
 						}

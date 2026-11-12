@@ -4736,8 +4736,7 @@ test('push: foreign keys are re-created around a primary key, unique constraint 
 
 	const { sqlStatements } = await diffTestSchemasPush(client, schema1, schema2, [], false, ['public']);
 
-	// Push does not see every change generate sees, but at least the renamed index is re-created.
-	expect(expectForeignKeysAroundDroppedKeys(sqlStatements)).toBeGreaterThanOrEqual(1);
+	expect(expectForeignKeysAroundDroppedKeys(sqlStatements)).toBe(3);
 
 	for (const st of sqlStatements) await client.exec(st);
 	await expectDatabaseMatches(client, schema2);

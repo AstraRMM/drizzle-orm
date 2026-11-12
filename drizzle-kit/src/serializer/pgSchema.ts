@@ -606,11 +606,12 @@ export const PgSquasher = {
 	unsquashIdxPush: (input: string): Index => {
 		const [name, columnsString, isUnique, method, idxWith] = input.split(';');
 
-		const columnString = columnsString.split('--');
+		// squashIdxPush joins columns with ',,' and the parts of a column with '--'.
+		const columnString = columnsString.split(',,');
 		const columns: IndexColumnType[] = [];
 
 		for (const column of columnString) {
-			const [expression, asc, nulls, opclass] = column.split(',');
+			const [expression, asc, nulls] = column.split('--');
 			columns.push({
 				nulls: nulls as IndexColumnType['nulls'],
 				isExpression: expression === '',
