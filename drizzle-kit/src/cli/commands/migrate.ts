@@ -17,7 +17,15 @@ import { SingleStoreSchema, singlestoreSchema, squashSingleStoreScheme } from 's
 import { TypeOf } from 'zod';
 import type { CommonSchema } from '../../schemaValidator';
 import { MySqlSchema, mysqlSchema, squashMysqlScheme, ViewSquashed } from '../../serializer/mysqlSchema';
-import { PgSchema, pgSchema, Policy, Role, squashPgScheme, View } from '../../serializer/pgSchema';
+import {
+	normalizePgPushSchema,
+	PgSchema,
+	pgSchema,
+	Policy,
+	Role,
+	squashPgScheme,
+	View,
+} from '../../serializer/pgSchema';
 import { SQLiteSchema, sqliteSchema, squashSqliteScheme, View as SQLiteView } from '../../serializer/sqliteSchema';
 import {
 	applyLibSQLSnapshotsDiff,
@@ -411,7 +419,7 @@ export const preparePgPush = async (
 	prev: PgSchema,
 ) => {
 	const validatedPrev = pgSchema.parse(prev);
-	const validatedCur = pgSchema.parse(cur);
+	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur), validatedPrev);
 
 	const squashedPrev = squashPgScheme(validatedPrev, 'push');
 	const squashedCur = squashPgScheme(validatedCur, 'push');

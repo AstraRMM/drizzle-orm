@@ -9,6 +9,7 @@ import {
 	cidr,
 	date,
 	doublePrecision,
+	foreignKey,
 	index,
 	inet,
 	integer,
@@ -25,6 +26,7 @@ import {
 	pgSchema,
 	pgTable,
 	pgView,
+	primaryKey,
 	real,
 	serial,
 	smallint,
@@ -36,6 +38,7 @@ import {
 	varchar,
 } from 'drizzle-orm/pg-core';
 import fs from 'fs';
+import { fromDatabase } from 'src/serializer/pgSerializer';
 import { introspectPgToFile } from 'tests/schemaDiffer';
 import { expect, test } from 'vitest';
 
@@ -925,4 +928,140 @@ test('multiple policies with roles from schema', async () => {
 
 	expect(statements.length).toBe(0);
 	expect(sqlStatements.length).toBe(0);
+});
+
+test('introspect composite fk with ON DELETE SET NULL / SET DEFAULT column lists', async () => {
+	const client = new PGlite();
+
+	const users = pgTable('users', {
+		orgId: integer('org_id').notNull(),
+		id: integer('id').notNull(),
+	}, (t) => [primaryKey({ columns: [t.orgId, t.id] })]);
+
+	const posts = pgTable('posts', {
+		id: integer('id').primaryKey(),
+		orgId: integer('org_id').notNull(),
+		authorId: integer('author_id'),
+		editorId: integer('editorId'),
+	}, (t) => [
+		foreignKey({
+			name: 'posts_author_fk',
+			columns: [t.orgId, t.authorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set null (author_id)'),
+		foreignKey({
+			name: 'posts_editor_fk',
+			columns: [t.orgId, t.editorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set default ("editorId")'),
+	]);
+
+	const { statements, sqlStatements } = await introspectPgToFile(
+		client,
+		{ users, posts },
+		'introspect-fk-delete-column-list',
+	);
+
+	expect(statements.length).toBe(0);
+	expect(sqlStatements.length).toBe(0);
+
+	const introspected = await introspectPublicSchema(client);
+	const foreignKeys = introspected.tables['public.posts']!.foreignKeys;
+	expect(foreignKeys['posts_author_fk']!.onDelete).toBe('set null ("author_id")');
+	expect(foreignKeys['posts_editor_fk']!.onDelete).toBe('set default ("editorId")');
+});
+
+test("introspect keeps a unique index referenced by another table's foreign key", async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "accounts" ("id" integer PRIMARY KEY NOT NULL, "slug" text NOT NULL);
+		CREATE UNIQUE INDEX "accounts_slug_idx" ON "accounts" USING btree ("slug");
+		CREATE TABLE "memberships" (
+			"id" integer PRIMARY KEY NOT NULL,
+			"account_slug" text NOT NULL,
+			CONSTRAINT "memberships_account_slug_fk" FOREIGN KEY ("account_slug") REFERENCES "accounts"("slug")
+		);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	expect(Object.keys(introspected.tables['public.accounts']!.indexes)).toEqual(['accounts_slug_idx']);
+	expect(introspected.tables['public.accounts']!.indexes['accounts_slug_idx']!.isUnique).toBe(true);
+});
+
+test('introspect reads a named single-column primary key as a table-level key', async () => {
+	const client = new PGlite();
+	await client.exec(`
+		CREATE TABLE "deliveries" ("source_event_id" text NOT NULL, CONSTRAINT "delivery_source_event_pk" PRIMARY KEY ("source_event_id"));
+		CREATE TABLE "plain" ("id" integer PRIMARY KEY);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	expect(introspected.tables['public.deliveries']!.compositePrimaryKeys).toStrictEqual({
+		delivery_source_event_pk: { name: 'delivery_source_event_pk', columns: ['source_event_id'] },
+	});
+	expect(introspected.tables['public.deliveries']!.columns['source_event_id']!.primaryKey).toBe(false);
+	expect(introspected.tables['public.plain']!.compositePrimaryKeys).toStrictEqual({});
+	expect(introspected.tables['public.plain']!.columns['id']!.primaryKey).toBe(true);
+});
+
+test('introspect reads quoted negative numbers and ARRAY constructors as column defaults', async () => {
+	const client = new PGlite();
+	await client.exec(`
+		CREATE TABLE "counters" (
+			"sequence" bigint DEFAULT -1 NOT NULL,
+			"tags" text[] DEFAULT ARRAY[]::text[] NOT NULL
+		);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	expect(introspected.tables['public.counters']!.columns['sequence']!.default).toBe(-1);
+	expect(introspected.tables['public.counters']!.columns['tags']!.default).toBe('ARRAY[]');
+});
+
+test('introspect marks only the expression columns of a mixed index as expressions', async () => {
+	const client = new PGlite();
+	await client.exec(`
+		CREATE TABLE "events" ("repository_id" text NOT NULL, "status" text NOT NULL);
+		CREATE INDEX "events_opaque_idx" ON "events" (substr(md5("repository_id"), 1, 16), "status");
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	const columns = introspected.tables['public.events']!.indexes['events_opaque_idx']!.columns;
+	expect(columns.map((it) => [it.expression, it.isExpression])).toStrictEqual([
+		['substr(md5(repository_id), 1, 16)', true],
+		['status', false],
+	]);
+});
+
+async function introspectPublicSchema(client: PGlite) {
+	return fromDatabase(
+		{
+			query: async (query: string, values?: any[] | undefined) => {
+				const res = await client.query(query, values);
+				return res.rows as any[];
+			},
+		},
+		undefined,
+		['public'],
+	);
+}
+
+test('introspect pairs composite foreign key columns in key order', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "parents" ("x" integer NOT NULL, "y" integer NOT NULL, PRIMARY KEY ("x", "y"));
+		CREATE TABLE "children" (
+			"id" integer PRIMARY KEY NOT NULL,
+			"a" integer,
+			"b" integer,
+			CONSTRAINT "children_parent_fk" FOREIGN KEY ("b", "a") REFERENCES "parents"("x", "y")
+		);
+	`);
+
+	const introspected = await introspectPublicSchema(client);
+	const fk = introspected.tables['public.children']!.foreignKeys['children_parent_fk']!;
+	expect(fk.columnsFrom).toStrictEqual(['b', 'a']);
+	expect(fk.columnsTo).toStrictEqual(['x', 'y']);
 });

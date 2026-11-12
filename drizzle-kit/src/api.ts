@@ -43,7 +43,7 @@ import type { Config } from './index';
 import { MySqlSchema as MySQLSchemaKit, mysqlSchema, squashMysqlScheme } from './serializer/mysqlSchema';
 import { generateMySqlSnapshot } from './serializer/mysqlSerializer';
 import { prepareFromExports } from './serializer/pgImports';
-import { PgSchema as PgSchemaKit, pgSchema, squashPgScheme } from './serializer/pgSchema';
+import { normalizePgPushSchema, PgSchema as PgSchemaKit, pgSchema, squashPgScheme } from './serializer/pgSchema';
 import { generatePgSnapshot } from './serializer/pgSerializer';
 import {
 	SingleStoreSchema as SingleStoreSchemaKit,
@@ -151,7 +151,7 @@ export const pushSchema = async (
 	);
 
 	const validatedPrev = pgSchema.parse(prev);
-	const validatedCur = pgSchema.parse(cur);
+	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur), validatedPrev);
 
 	const squashedPrev = squashPgScheme(validatedPrev, 'push');
 	const squashedCur = squashPgScheme(validatedCur, 'push');

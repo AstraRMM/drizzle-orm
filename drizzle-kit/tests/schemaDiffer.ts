@@ -54,7 +54,7 @@ import { prepareFromMySqlImports } from 'src/serializer/mysqlImports';
 import { mysqlSchema, squashMysqlScheme, ViewSquashed } from 'src/serializer/mysqlSchema';
 import { fromDatabase as fromMySqlDatabase, generateMySqlSnapshot } from 'src/serializer/mysqlSerializer';
 import { prepareFromPgImports } from 'src/serializer/pgImports';
-import { pgSchema, Policy, Role, squashPgScheme, View } from 'src/serializer/pgSchema';
+import { normalizePgPushSchema, pgSchema, Policy, Role, squashPgScheme, View } from 'src/serializer/pgSchema';
 import { fromDatabase, generatePgSnapshot } from 'src/serializer/pgSerializer';
 import { prepareFromSingleStoreImports } from 'src/serializer/singlestoreImports';
 import { singlestoreSchema, squashSingleStoreScheme } from 'src/serializer/singlestoreSchema';
@@ -1043,13 +1043,16 @@ export const diffTestSchemasPush = async (
 		...rest1,
 	} as const;
 
-	const sch2 = {
-		version: '7',
-		dialect: 'postgresql',
-		id: '0',
-		prevId: '0',
-		...rest2,
-	} as const;
+	const sch2 = normalizePgPushSchema(
+		{
+			version: '7',
+			dialect: 'postgresql',
+			id: '0',
+			prevId: '0',
+			...rest2,
+		} as const,
+		pgSchema.parse(sch1),
+	);
 
 	const sn1 = squashPgScheme(sch1, 'push');
 	const sn2 = squashPgScheme(sch2, 'push');

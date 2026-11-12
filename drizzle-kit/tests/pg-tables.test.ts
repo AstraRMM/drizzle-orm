@@ -863,7 +863,7 @@ test('optional db aliases (snake case)', async () => {
 
 	const st7 = `CREATE INDEX "t1_idx" ON "t1" USING btree ("t1_idx") WHERE "t1"."t1_idx" > 0;`;
 
-	expect(sqlStatements).toStrictEqual([st1, st2, st3, st4, st5, st6, st7]);
+	expect(sqlStatements).toStrictEqual([st1, st2, st3, st6, st7, st4, st5]);
 });
 
 test('optional db aliases (camel case)', async () => {
@@ -953,5 +953,5 @@ test('optional db aliases (camel case)', async () => {
 
 	const st7 = `CREATE INDEX "t1Idx" ON "t1" USING btree ("t1Idx") WHERE "t1"."t1Idx" > 0;`;
 
-	expect(sqlStatements).toStrictEqual([st1, st2, st3, st4, st5, st6, st7]);
+	expect(sqlStatements).toStrictEqual([st1, st2, st3, st6, st7, st4, st5]);
 });

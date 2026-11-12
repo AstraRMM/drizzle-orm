@@ -43,6 +43,59 @@ import type {
 import { type DB, escapeSingleQuotes, isPgArrayType } from '../utils';
 import { getColumnCasing, sqlToStr } from './utils';
 
+/**
+ * Brings an `ON DELETE` action to one spelling so the schema and the database compare equal.
+ * PostgreSQL 15+ column lists (`set null (a, b)`) are rewritten with every column quoted and
+ * unquoted names folded to lower case, the way PostgreSQL resolves them:
+ * `SET NULL (Author_Id,"editorId")` becomes `set null ("author_id", "editorId")`.
+ * Other actions, and lists that cannot be parsed, are returned unchanged.
+ */
+export function normalizePgDeleteAction(action: string | undefined): string | undefined {
+	if (action === undefined) return action;
+	const match = /^\s*(set\s+null|set\s+default)\s*\((.*)\)\s*$/is.exec(action);
+	if (!match) return action;
+
+	const names: string[] = [];
+	const list = match[2]!;
+	let i = 0;
+	while (i < list.length) {
+		while (i < list.length && /\s/.test(list[i]!)) i++;
+		let name = '';
+		if (list[i] === '"') {
+			i++;
+			for (;;) {
+				if (i >= list.length) return action;
+				if (list[i] === '"') {
+					if (list[i + 1] === '"') {
+						name += '"';
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				name += list[i++];
+			}
+			while (i < list.length && /\s/.test(list[i]!)) i++;
+		} else {
+			const start = i;
+			while (i < list.length && list[i] !== ',') i++;
+			name = list.slice(start, i).trim().toLowerCase();
+			if (name === '' || /[\s"]/.test(name)) return action;
+		}
+		names.push(name);
+		if (i < list.length) {
+			if (list[i] !== ',') return action;
+			i++;
+			if (i >= list.length) return action;
+		}
+	}
+	if (names.length === 0) return action;
+
+	const keyword = match[1]!.toLowerCase().replace(/\s+/g, ' ');
+	return `${keyword} (${names.map((name) => `"${name.replace(/"/g, '""')}"`).join(', ')})`;
+}
+
 export const indexName = (tableName: string, columns: string[]) => {
 	return `${tableName}_${columns.join('_')}_index`;
 };
@@ -324,7 +377,7 @@ export const generatePgSnapshot = (
 
 		const fks: ForeignKey[] = foreignKeys.map((fk) => {
 			const tableFrom = tableName;
-			const onDelete = fk.onDelete;
+			const onDelete = normalizePgDeleteAction(fk.onDelete);
 			const onUpdate = fk.onUpdate;
 			const reference = fk.reference();
 
@@ -1228,12 +1281,18 @@ WHERE
 					const tableResponse = await getColumnsInfoQuery({ schema: tableSchema, table: tableName, db });
 
 					const tableConstraints = await db.query(
-						`SELECT c.column_name, c.data_type, constraint_type, constraint_name, constraint_schema
+						`SELECT c.column_name, c.data_type, tc.constraint_type, tc.constraint_name, tc.constraint_schema
       FROM information_schema.table_constraints tc
       JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
       JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
         AND tc.table_name = c.table_name AND ccu.column_name = c.column_name
-      WHERE tc.table_name = '${tableName}' and constraint_schema = '${tableSchema}';`,
+      -- Key order of primary key and unique constraint columns, from the catalog.
+      LEFT JOIN pg_catalog.pg_namespace AS kn ON kn.nspname = tc.constraint_schema
+      LEFT JOIN pg_catalog.pg_class AS kr ON kr.relnamespace = kn.oid AND kr.relname = tc.table_name
+      LEFT JOIN pg_catalog.pg_constraint AS kc ON kc.conrelid = kr.oid AND kc.conname = tc.constraint_name
+      LEFT JOIN pg_catalog.pg_attribute AS ka ON ka.attrelid = kr.oid AND ka.attname = c.column_name
+      WHERE tc.table_name = '${tableName}' and tc.constraint_schema = '${tableSchema}'
+      ORDER BY tc.constraint_name, array_position(kc.conkey, ka.attnum);`,
 					);
 
 					const tableChecks = await db.query(`SELECT 
@@ -1288,21 +1347,30 @@ WHERE
               WHEN 'n' THEN 'SET NULL'
               WHEN 'c' THEN 'CASCADE'
               WHEN 'd' THEN 'SET DEFAULT'
-            END AS delete_rule
+            END || COALESCE((
+              SELECT ' (' || string_agg(quote_ident(delete_att.attname), ', ' ORDER BY delete_col.ordinality) || ')'
+              FROM jsonb_array_elements_text(NULLIF(to_jsonb(con)->'confdelsetcols', 'null'::jsonb))
+                WITH ORDINALITY AS delete_col(attnum, ordinality)
+              JOIN pg_catalog.pg_attribute delete_att
+                ON delete_att.attrelid = con.conrelid AND delete_att.attnum = delete_col.attnum::smallint
+            ), '') AS delete_rule
           FROM
             pg_catalog.pg_constraint con
             JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
             JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace
-            LEFT JOIN pg_catalog.pg_attribute att ON att.attnum = ANY (con.conkey)
+            -- Pair each key column with the column it references, in key order.
+            CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS fk_col(attnum, fattnum, ordinality)
+            LEFT JOIN pg_catalog.pg_attribute att ON att.attnum = fk_col.attnum
               AND att.attrelid = con.conrelid
             LEFT JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid
             LEFT JOIN pg_catalog.pg_namespace fnsp ON fnsp.oid = frel.relnamespace
-            LEFT JOIN pg_catalog.pg_attribute fatt ON fatt.attnum = ANY (con.confkey)
+            LEFT JOIN pg_catalog.pg_attribute fatt ON fatt.attnum = fk_col.fattnum
               AND fatt.attrelid = con.confrelid
           WHERE
             nsp.nspname = '${tableSchema}'
             AND rel.relname = '${tableName}'
-            AND con.contype IN ('f');`,
+            AND con.contype IN ('f')
+          ORDER BY con.conname, fk_col.ordinality;`,
 					);
 
 					foreignKeysCount += tableForeignKeys.length;
@@ -1317,7 +1385,13 @@ WHERE
 						const schemaTo: string = fk.foreign_table_schema;
 						const foreignKeyName = fk.constraint_name;
 						const onUpdate = fk.update_rule?.toLowerCase();
-						const onDelete = fk.delete_rule?.toLowerCase();
+						// Lowercase only the action keyword; a PostgreSQL 15+ column list (`SET NULL (col)`) keeps its identifiers.
+						const onDelete = normalizePgDeleteAction(
+							fk.delete_rule?.replace(
+								/^(NO ACTION|RESTRICT|SET NULL|CASCADE|SET DEFAULT)/,
+								(action: string) => action.toLowerCase(),
+							),
+						);
 
 						if (typeof foreignKeysToReturn[foreignKeyName] !== 'undefined') {
 							foreignKeysToReturn[foreignKeyName].columnsFrom.push(columnFrom);
@@ -1334,15 +1408,25 @@ WHERE
 								onUpdate,
 							};
 						}
-
-						foreignKeysToReturn[foreignKeyName].columnsFrom = [
-							...new Set(foreignKeysToReturn[foreignKeyName].columnsFrom),
-						];
-
-						foreignKeysToReturn[foreignKeyName].columnsTo = [...new Set(foreignKeysToReturn[foreignKeyName].columnsTo)];
 					}
 
 					const uniqueConstrainsRows = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'UNIQUE');
+
+					// NULLS NOT DISTINCT (PostgreSQL 15+) lives on the index behind the constraint. Read it
+					// through to_jsonb so older servers, which have no such column, still work.
+					const uniqueNullsNotDistinct = new Set(
+						uniqueConstrainsRows.length === 0 ? [] : (await db.query(
+							`SELECT con.conname AS constraint_name
+              FROM pg_catalog.pg_constraint con
+              JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+              JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+              JOIN pg_catalog.pg_index idx ON idx.indexrelid = con.conindid
+              WHERE con.contype = 'u'
+                AND nsp.nspname = '${tableSchema}'
+                AND rel.relname = '${tableName}'
+                AND COALESCE((to_jsonb(idx)->>'indnullsnotdistinct')::boolean, false);`,
+						)).map((row: { constraint_name: string }) => row.constraint_name),
+					);
 
 					for (const unqs of uniqueConstrainsRows) {
 						// const tableFrom = fk.table_name;
@@ -1354,7 +1438,7 @@ WHERE
 						} else {
 							uniqueConstrains[constraintName] = {
 								columns: [columnName],
-								nullsNotDistinct: false,
+								nullsNotDistinct: uniqueNullsNotDistinct.has(constraintName),
 								name: constraintName,
 							};
 						}
@@ -1403,8 +1487,12 @@ WHERE
 						);
 
 						const cprimaryKey = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'PRIMARY KEY');
+						// A column-level primary key always gets PostgreSQL's automatic "<table>_pkey" name.
+						// A single-column key with any other name was declared with primaryKey({ ... }).
+						const namedSingleColumnPk = cprimaryKey.length === 1
+							&& !String(cprimaryKey[0].constraint_name).endsWith('_pkey');
 
-						if (cprimaryKey.length > 1) {
+						if (cprimaryKey.length > 1 || namedSingleColumnPk) {
 							const tableCompositePkName = await db.query(
 								`SELECT conname AS primary_key
             FROM   pg_constraint join pg_class on (pg_class.oid = conrelid)
@@ -1499,7 +1587,7 @@ WHERE
 							typeSchema: enumsToReturn[`${typeSchema}.${enumType}`] !== undefined
 								? enumsToReturn[`${typeSchema}.${enumType}`].schema
 								: undefined,
-							primaryKey: primaryKey.length === 1 && cprimaryKey.length < 2,
+							primaryKey: primaryKey.length === 1 && cprimaryKey.length < 2 && !namedSingleColumnPk,
 							// default: isSerial ? undefined : defaultValue,
 							notNull: columnResponse.is_nullable === 'NO',
 							generated: isGenerated
@@ -1546,10 +1634,9 @@ WHERE
         am.amname as method,
         ic.reloptions as with,
         coalesce(a.attname, pg_get_indexdef(i.indexrelid, k.i, false)) AS column_name,
-          CASE
-        WHEN pg_get_expr(i.indexprs, i.indrelid) IS NOT NULL THEN 1
-        ELSE 0
-    END AS is_expression,
+        -- Per key column: attnum 0 (no pg_attribute row) is an expression. Checking indexprs
+        -- marked every column of an index with any expression as an expression.
+        CASE WHEN a.attname IS NULL THEN 1 ELSE 0 END AS is_expression,
         i.indoption[k.i-1] & 1 = 1 AS descending,
         i.indoption[k.i-1] & 2 = 2 AS nulls_first,
         pg_get_expr(
@@ -1581,6 +1668,10 @@ WHERE
           pg_stat_user_indexes idx
         LEFT JOIN
           pg_constraint con ON con.conindid = idx.indexrelid
+            -- A foreign key stores the referenced index in conindid too. Only count constraints
+            -- that this index backs on its own table (primary key, unique, exclusion).
+            AND con.conrelid = idx.relid
+            AND con.contype IN ('p', 'u', 'x')
         WHERE idx.relname = '${tableName}' and schemaname = '${tableSchema}'
         group by index_name, table_name,schemaname, generated_by_constraint;`,
 					);
@@ -1962,6 +2053,11 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 
 	const columnDefaultAsString: string = column.column_default.toString();
 
+	// An ARRAY[...] constructor is an expression, not an array literal ('{...}').
+	if (columnDefaultAsString.startsWith('ARRAY[')) {
+		return columnDefaultAsString;
+	}
+
 	if (isArray) {
 		return `'{${
 			columnDefaultAsString
@@ -1989,6 +2085,9 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 	if (['integer', 'smallint', 'bigint', 'double precision', 'real'].includes(column.data_type)) {
 		if (/^-?[\d.]+(?:e-?\d+)?$/.test(columnDefaultAsString)) {
 			return Number(columnDefaultAsString);
+		} else if (/^'-?[\d.]+(?:e-?\d+)?'$/.test(columnDefaultAsString)) {
+			// PostgreSQL prints negative numeric constants quoted, e.g. '-1'::integer.
+			return Number(columnDefaultAsString.slice(1, -1));
 		} else {
 			if (typeof internals!.tables![tableName] === 'undefined') {
 				internals!.tables![tableName] = {
