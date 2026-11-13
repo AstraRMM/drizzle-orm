@@ -889,8 +889,12 @@ function comparablePushIndexColumn(column: Index['columns'][number]) {
 	return `${bare ? bare[1] ?? bare[2] : ''}--${asc}--${nulls}`;
 }
 
+// YugabyteDB (YSQL) builds `USING btree` as its lsm access method and `USING gin` as ybgin.
+const pgCompatibleIndexMethods: Record<string, string> = { lsm: 'btree', ybgin: 'gin' };
+
 function comparablePushIndex(idx: Index): string {
-	return `${idx.columns.map(comparablePushIndexColumn).join(',,')};${idx.isUnique};${idx.method};${
+	const method = pgCompatibleIndexMethods[idx.method] ?? idx.method;
+	return `${idx.columns.map(comparablePushIndexColumn).join(',,')};${idx.isUnique};${method};${
 		JSON.stringify(idx.with)
 	};${idx.where ?? ''}`;
 }
