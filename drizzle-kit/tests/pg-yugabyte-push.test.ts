@@ -78,7 +78,12 @@ const scopeUnique = (method: string, columns = ['scope_id', 'id']) => ({
 	method,
 	isUnique: true,
 });
-const trigram = (method: string) => ({ name: 'child_scope_trgm_idx', columns: ['scope_id'], method, opclass: 'gin_trgm_ops' });
+const trigram = (method: string) => ({
+	name: 'child_scope_trgm_idx',
+	columns: ['scope_id'],
+	method,
+	opclass: 'gin_trgm_ops',
+});
 
 test('push matches YugabyteDB lsm and ybgin indexes to btree and gin and leaves the foreign key alone', async () => {
 	const schema = snapshot([scopeUnique('btree')], [trigram('gin')]);
@@ -108,7 +113,8 @@ test('push still re-creates an index whose access method really changed', async 
 	const { sqlStatements } = await preparePgPush(schema, database);
 
 	expect(sqlStatements).toContain('DROP INDEX "child_scope_trgm_idx";');
-	expect(sqlStatements.some((it) => it.startsWith('CREATE INDEX "child_scope_trgm_idx"') && it.includes('USING btree'))).toBe(
-		true,
-	);
+	expect(sqlStatements.some((it) => it.startsWith('CREATE INDEX "child_scope_trgm_idx"') && it.includes('USING btree')))
+		.toBe(
+			true,
+		);
 });

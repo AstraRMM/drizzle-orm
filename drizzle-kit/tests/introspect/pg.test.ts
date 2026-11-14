@@ -1065,3 +1065,28 @@ test('introspect pairs composite foreign key columns in key order', async () => 
 	expect(fk.columnsFrom).toStrictEqual(['b', 'a']);
 	expect(fk.columnsTo).toStrictEqual(['x', 'y']);
 });
+
+test('introspect leaves out the sequences of tables the tables filter excludes', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "kept" ("id" serial PRIMARY KEY);
+		CREATE TABLE "ledger" ("id" serial PRIMARY KEY);
+		CREATE TABLE "leases" ("id" bigint GENERATED ALWAYS AS IDENTITY);
+		CREATE SEQUENCE "standalone_seq";
+	`);
+
+	const introspected = await fromDatabase(
+		{
+			query: async (query: string, values?: any[] | undefined) => {
+				const res = await client.query(query, values);
+				return res.rows as any[];
+			},
+		},
+		(table) => table !== 'ledger' && table !== 'leases',
+		['public'],
+	);
+
+	expect(Object.keys(introspected.tables)).toStrictEqual(['public.kept']);
+	expect(Object.keys(introspected.sequences)).toStrictEqual(['public.standalone_seq']);
+});

@@ -1092,11 +1092,15 @@ WHERE
 
 	const seqWhere = schemaFilters.map((t) => `schemaname = '${t}'`).join(' or ');
 
-	const allSequences = await db.query(
-		`select schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle, cache_size from pg_sequences as seq${
-			seqWhere === '' ? '' : ` WHERE ${seqWhere}`
-		};`,
-	);
+	const allSequences = (await db.query(
+		`select schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle, cache_size,
+		(select owner.relname from pg_catalog.pg_depend dep
+			join pg_catalog.pg_class owner on owner.oid = dep.refobjid
+			where dep.classid = 'pg_catalog.pg_class'::regclass and dep.objid = format('%I.%I', schemaname, sequencename)::regclass
+				and dep.refclassid = 'pg_catalog.pg_class'::regclass and dep.deptype in ('a', 'i')
+			limit 1) as owner_table
+		from pg_sequences as seq${seqWhere === '' ? '' : ` WHERE ${seqWhere}`};`,
+	)).filter((seq) => seq.owner_table === null || seq.owner_table === undefined || tablesFilter(seq.owner_table));
 
 	for (const dbSeq of allSequences) {
 		const schemaName = dbSeq.schemaname;
