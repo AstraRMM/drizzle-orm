@@ -2213,7 +2213,7 @@ ORDER BY ns.nspname, cls.relname, a.attnum;`,
         LEFT JOIN pg_am AS am ON ic.relam = am.oid
         LEFT JOIN pg_opclass opc ON opc.oid = i.indclass[k.i - 1]
       WHERE ${inSchemas('c.nspname')}
-        AND k.i <= COALESCE((to_jsonb(i)->>'indnkeyatts')::int, i.indnatts)
+        AND k.i <= COALESCE((to_jsonb(i.*)->>'indnkeyatts')::int, i.indnatts)
       ORDER BY c.nspname, t.relname, ic.relname, k.i;`,
 	);
 

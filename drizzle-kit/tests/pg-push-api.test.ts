@@ -1,6 +1,6 @@
 import { PGlite } from '@electric-sql/pglite';
-import { drizzle } from 'drizzle-orm/pglite';
 import { index, integer, pgSequence, pgTable } from 'drizzle-orm/pg-core';
+import { drizzle } from 'drizzle-orm/pglite';
 import { pushSchema } from 'src/api';
 import { expect, test } from 'vitest';
 
