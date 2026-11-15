@@ -417,9 +417,10 @@ export const prepareAndExportPg = async (config: ExportConfig) => {
 export const preparePgPush = async (
 	cur: PgSchema,
 	prev: PgSchema,
+	options?: { sequenceCacheMinimum?: number },
 ) => {
 	const validatedPrev = pgSchema.parse(prev);
-	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur), validatedPrev);
+	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur), validatedPrev, options);
 
 	const squashedPrev = squashPgScheme(validatedPrev, 'push');
 	const squashedCur = squashPgScheme(validatedCur, 'push');

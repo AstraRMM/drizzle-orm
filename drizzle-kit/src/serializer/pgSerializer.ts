@@ -1018,6 +1018,12 @@ function prepareRoles(entities?: {
 	return { useRoles, includeRoles, excludeRoles };
 }
 
+// YugabyteDB stores a sequence cache below ysql_sequence_cache_minval (100 by default) as that minimum.
+export const pgSequenceCacheMinimum = async (db: DB): Promise<number> => {
+	const [row] = await db.query<{ version: string }>('select version() as version');
+	return /-YB-/.test(row?.version ?? '') ? 100 : 1;
+};
+
 export const fromDatabase = async (
 	db: DB,
 	tablesFilter: (table: string) => boolean = () => true,

@@ -906,10 +906,20 @@ function comparablePushIndex(idx: Index): string {
  * keeps the schema's text, so push emits the SQL the user wrote. Only push uses this, so
  * snapshots and generated migrations are unchanged.
  */
-export function normalizePgPushSchema<T extends PgSchema>(json: T, database: PgSchema): T {
+export function normalizePgPushSchema<T extends PgSchema>(
+	json: T,
+	database: PgSchema,
+	{ sequenceCacheMinimum = 1 }: { sequenceCacheMinimum?: number } = {},
+): T {
 	const truncated = truncatePgSchemaIdentifiers(json);
+	const withStoredCache = <S extends { cache?: string }>(seq: S, dbSeq: { cache?: string } | undefined): S => {
+		if (!dbSeq || seq.cache === dbSeq.cache) return seq;
+		const stored = (cache: string | undefined) => String(Math.max(Number(cache ?? '1'), sequenceCacheMinimum));
+		return stored(seq.cache) === stored(dbSeq.cache) ? { ...seq, cache: dbSeq.cache } : seq;
+	};
 	return {
 		...truncated,
+		sequences: mapEntries(truncated.sequences, (seq, key) => withStoredCache(seq, database.sequences[key])),
 		tables: mapEntries(truncated.tables, (table, key) => {
 			const dbTable = database.tables[key];
 			if (!dbTable) return table;
@@ -917,10 +927,13 @@ export function normalizePgPushSchema<T extends PgSchema>(json: T, database: PgS
 				...table,
 				columns: mapEntries(table.columns, (column, name) => {
 					const dbColumn = dbTable.columns[name];
-					if (!dbColumn || column.default === dbColumn.default) return column;
-					const same = comparablePushDefault(column.default, column.type)
+					if (!dbColumn) return column;
+					const identity = column.identity && withStoredCache(column.identity, dbColumn.identity);
+					const current = identity === column.identity ? column : { ...column, identity };
+					if (current.default === dbColumn.default) return current;
+					const same = comparablePushDefault(current.default, current.type)
 						=== comparablePushDefault(dbColumn.default, dbColumn.type);
-					return same ? { ...column, default: dbColumn.default } : column;
+					return same ? { ...current, default: dbColumn.default } : current;
 				}),
 				indexes: mapEntries(table.indexes, (idx, name) => {
 					const dbIndex = dbTable.indexes[name];

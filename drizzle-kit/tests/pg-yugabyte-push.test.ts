@@ -118,3 +118,72 @@ test('push still re-creates an index whose access method really changed', async 
 			true,
 		);
 });
+
+const sequenced = (cache: string) =>
+	({
+		...snapshot([], []),
+		tables: {
+			'public.decisions': {
+				name: 'decisions',
+				schema: '',
+				columns: {
+					sequence: {
+						name: 'sequence',
+						type: 'bigint',
+						primaryKey: false,
+						notNull: true,
+						identity: {
+							name: 'decisions_sequence_seq',
+							schema: 'public',
+							type: 'always',
+							increment: '1',
+							minValue: '1',
+							maxValue: '9223372036854775807',
+							startWith: '1',
+							cache,
+							cycle: false,
+						},
+					},
+				},
+				indexes: {},
+				foreignKeys: {},
+				compositePrimaryKeys: {},
+				uniqueConstraints: {},
+				policies: {},
+				checkConstraints: {},
+				isRLSEnabled: false,
+			},
+		},
+		sequences: {
+			'public.counter': {
+				name: 'counter',
+				schema: 'public',
+				increment: '1',
+				minValue: '1',
+				maxValue: '9223372036854775807',
+				startWith: '1',
+				cache,
+				cycle: false,
+			},
+		},
+	}) as any;
+
+test('push accepts the cache YugabyteDB raised to its minimum for identities and sequences', async () => {
+	const { sqlStatements } = await preparePgPush(sequenced('1'), sequenced('100'), { sequenceCacheMinimum: 100 });
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push still changes a cache that differs on PostgreSQL', async () => {
+	const { sqlStatements } = await preparePgPush(sequenced('1'), sequenced('100'));
+
+	expect(sqlStatements.some((it) => it.includes('"decisions"') && it.includes('SET CACHE 1'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('"public"."counter"') && it.includes('CACHE 1'))).toBe(true);
+});
+
+test('push still changes a cache above the YugabyteDB minimum', async () => {
+	const { sqlStatements } = await preparePgPush(sequenced('500'), sequenced('100'), { sequenceCacheMinimum: 100 });
+
+	expect(sqlStatements.some((it) => it.includes('"decisions"') && it.includes('SET CACHE 500'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('"public"."counter"') && it.includes('CACHE 500'))).toBe(true);
+});
