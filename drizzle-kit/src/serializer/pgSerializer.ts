@@ -2089,19 +2089,18 @@ ORDER BY ns.nspname, cls.relname, a.attnum;`,
 	);
 
 	const constraints = await db.query<CatalogRow>(
-		`SELECT tc.constraint_schema AS _schema, tc.table_name AS _table,
-      c.column_name, c.data_type, tc.constraint_type, tc.constraint_name, tc.constraint_schema
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
-      JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
-        AND tc.table_name = c.table_name AND ccu.column_name = c.column_name
-      -- Key order of primary key and unique constraint columns, from the catalog.
-      LEFT JOIN pg_catalog.pg_namespace AS kn ON kn.nspname = tc.constraint_schema
-      LEFT JOIN pg_catalog.pg_class AS kr ON kr.relnamespace = kn.oid AND kr.relname = tc.table_name
-      LEFT JOIN pg_catalog.pg_constraint AS kc ON kc.conrelid = kr.oid AND kc.conname = tc.constraint_name
-      LEFT JOIN pg_catalog.pg_attribute AS ka ON ka.attrelid = kr.oid AND ka.attname = c.column_name
-      WHERE ${inSchemas('tc.constraint_schema')}
-      ORDER BY tc.constraint_schema, tc.table_name, tc.constraint_name, array_position(kc.conkey, ka.attnum);`,
+		`SELECT nsp.nspname AS _schema, rel.relname AS _table,
+        att.attname AS column_name,
+        CASE con.contype WHEN 'p' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END AS constraint_type,
+        con.conname AS constraint_name,
+        nsp.nspname AS constraint_schema
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+      CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS key_col(attnum, ordinality)
+      JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key_col.attnum
+      WHERE con.contype IN ('p', 'u') AND ${inSchemas('nsp.nspname')}
+      ORDER BY nsp.nspname, rel.relname, con.conname, key_col.ordinality;`,
 	);
 
 	const checks = await db.query<CatalogRow>(
