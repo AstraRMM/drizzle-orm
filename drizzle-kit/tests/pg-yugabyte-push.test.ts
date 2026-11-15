@@ -187,3 +187,16 @@ test('push still changes a cache above the YugabyteDB minimum', async () => {
 	expect(sqlStatements.some((it) => it.includes('"decisions"') && it.includes('SET CACHE 500'))).toBe(true);
 	expect(sqlStatements.some((it) => it.includes('"public"."counter"') && it.includes('CACHE 500'))).toBe(true);
 });
+
+test('push changes a cache below the YugabyteDB minimum that differs from the database', async () => {
+	const { sqlStatements } = await preparePgPush(sequenced('1'), sequenced('50'), { sequenceCacheMinimum: 100 });
+
+	expect(sqlStatements.some((it) => it.includes('"decisions"') && it.includes('SET CACHE 1'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('"public"."counter"') && it.includes('CACHE 1'))).toBe(true);
+});
+
+test('push compares caches exactly with a YugabyteDB minimum of 0', async () => {
+	const { sqlStatements } = await preparePgPush(sequenced('1'), sequenced('100'), { sequenceCacheMinimum: 0 });
+
+	expect(sqlStatements.some((it) => it.includes('"decisions"') && it.includes('SET CACHE 1'))).toBe(true);
+});

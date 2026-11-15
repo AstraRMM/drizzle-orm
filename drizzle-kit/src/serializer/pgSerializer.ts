@@ -1019,9 +1019,12 @@ function prepareRoles(entities?: {
 }
 
 // YugabyteDB stores a sequence cache below ysql_sequence_cache_minval (100 by default) as that minimum.
+// SQL cannot read that server flag, so a cluster with another value sets YSQL_SEQUENCE_CACHE_MINVAL.
 export const pgSequenceCacheMinimum = async (db: DB): Promise<number> => {
 	const [row] = await db.query<{ version: string }>('select version() as version');
-	return /-YB-/.test(row?.version ?? '') ? 100 : 1;
+	if (!/-YB-/.test(row?.version ?? '')) return 1;
+	const configured = Number(process.env.YSQL_SEQUENCE_CACHE_MINVAL);
+	return Number.isInteger(configured) && configured >= 0 ? configured : 100;
 };
 
 export const fromDatabase = async (
@@ -1106,7 +1109,10 @@ WHERE
 				and dep.refclassid = 'pg_catalog.pg_class'::regclass and dep.deptype in ('a', 'i')
 			limit 1) as owner_table
 		from pg_sequences as seq${seqWhere === '' ? '' : ` WHERE ${seqWhere}`};`,
-	)).filter((seq) => seq.owner_table === null || seq.owner_table === undefined || tablesFilter(seq.owner_table));
+	)).filter((seq) =>
+		seq.owner_table === null || seq.owner_table === undefined || tablesFilter(seq.owner_table)
+		|| tsSchema?.sequences[`${seq.schemaname}.${seq.sequencename}`] !== undefined
+	);
 
 	for (const dbSeq of allSequences) {
 		const schemaName = dbSeq.schemaname;
@@ -1555,7 +1561,7 @@ WHERE
 						const indexMethod = dbIndex.method;
 						const indexWith: string[] = dbIndex.with;
 						const indexWhere: string = dbIndex.where;
-						const opclass: string = dbIndex.opcname;
+						const opclass: string | undefined = dbIndex.opcname ?? undefined;
 						const isExpression = dbIndex.is_expression === 1;
 
 						const desc: boolean = dbIndex.descending;
@@ -2206,8 +2212,8 @@ ORDER BY ns.nspname, cls.relname, a.attnum;`,
         LEFT JOIN pg_attribute AS a ON i.indrelid = a.attrelid AND k.attnum = a.attnum
         JOIN pg_namespace c on c.oid = t.relnamespace
         LEFT JOIN pg_am AS am ON ic.relam = am.oid
-        -- The operator class of this key column, not of any column of the index.
-        JOIN pg_opclass opc ON opc.oid = i.indclass[k.i - 1]
+        -- The operator class of this key column. INCLUDE columns have none and stay listed.
+        LEFT JOIN pg_opclass opc ON opc.oid = i.indclass[k.i - 1] AND k.i <= i.indnkeyatts
       WHERE ${inSchemas('c.nspname')}
       ORDER BY c.nspname, t.relname, ic.relname, k.i;`,
 	);

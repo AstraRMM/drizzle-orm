@@ -1090,3 +1090,104 @@ test('introspect leaves out the sequences of tables the tables filter excludes',
 	expect(Object.keys(introspected.tables)).toStrictEqual(['public.kept']);
 	expect(Object.keys(introspected.sequences)).toStrictEqual(['public.standalone_seq']);
 });
+
+const pgliteDb = (client: PGlite) => ({
+	query: async (query: string, values?: any[] | undefined) => {
+		const res = await client.query(query, values);
+		return res.rows as any[];
+	},
+});
+
+test('introspect keeps a declared sequence that an excluded table owns', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "ledger" ("id" integer PRIMARY KEY);
+		CREATE SEQUENCE "ledger_numbers" OWNED BY "ledger"."id";
+		CREATE TABLE "leases" ("id" serial PRIMARY KEY);
+	`);
+
+	const introspected = await fromDatabase(
+		pgliteDb(client),
+		(table) => table !== 'ledger' && table !== 'leases',
+		['public'],
+		undefined,
+		undefined,
+		{ sequences: { 'public.ledger_numbers': { name: 'ledger_numbers', schema: 'public' } }, policies: {} } as any,
+	);
+
+	expect(Object.keys(introspected.sequences)).toStrictEqual(['public.ledger_numbers']);
+});
+
+test('introspect reads keys and indexes of same-named tables in two schemas apart', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE SCHEMA "a";
+		CREATE SCHEMA "b";
+		CREATE TABLE "a"."items" ("id" integer PRIMARY KEY, "code" text NOT NULL, "rank" integer NOT NULL);
+		CREATE INDEX "a_items_code_idx" ON "a"."items" ("code");
+		CREATE TABLE "b"."items" ("code" text NOT NULL, "rank" integer NOT NULL, PRIMARY KEY ("code", "rank"));
+		CREATE UNIQUE INDEX "b_items_rank_idx" ON "b"."items" ("rank" DESC);
+	`);
+
+	const { tables } = await fromDatabase(pgliteDb(client), () => true, ['a', 'b']);
+
+	expect(tables['a.items'].columns['id'].primaryKey).toBe(true);
+	expect(tables['a.items'].compositePrimaryKeys).toStrictEqual({});
+	expect(Object.keys(tables['a.items'].indexes)).toStrictEqual(['a_items_code_idx']);
+	expect(tables['a.items'].indexes['a_items_code_idx'].columns.map((it) => it.expression)).toStrictEqual(['code']);
+	expect(Object.values(tables['b.items'].compositePrimaryKeys).map((it) => it.columns)).toStrictEqual([[
+		'code',
+		'rank',
+	]]);
+	expect(Object.keys(tables['b.items'].indexes)).toStrictEqual(['b_items_rank_idx']);
+	expect(tables['b.items'].indexes['b_items_rank_idx']).toMatchObject({
+		isUnique: true,
+		columns: [{ expression: 'rank', asc: false }],
+	});
+});
+
+test('introspect reads the operator class of each index column', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "t" ("name" text NOT NULL, "code" varchar(20) NOT NULL);
+		CREATE INDEX "t_lookup_idx" ON "t" ("name" text_pattern_ops, "code" varchar_ops);
+	`);
+
+	const { tables } = await fromDatabase(pgliteDb(client), () => true, ['public']);
+
+	expect(tables['public.t'].indexes['t_lookup_idx'].columns.map((it) => [it.expression, it.opclass])).toStrictEqual([
+		['name', 'text_pattern_ops'],
+		['code', 'varchar_ops'],
+	]);
+});
+
+test('introspect keeps the key order of a composite unique constraint', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "t" ("a" integer NOT NULL, "b" integer NOT NULL, "c" integer NOT NULL, CONSTRAINT "t_c_a_unique" UNIQUE ("c", "a"));
+	`);
+
+	const { tables } = await fromDatabase(pgliteDb(client), () => true, ['public']);
+
+	expect(tables['public.t'].uniqueConstraints['t_c_a_unique'].columns).toStrictEqual(['c', 'a']);
+});
+
+test('introspect lists the INCLUDE columns of an index', async () => {
+	const client = new PGlite();
+
+	await client.exec(`
+		CREATE TABLE "t" ("a" integer NOT NULL, "b" integer NOT NULL);
+		CREATE INDEX "t_a_idx" ON "t" ("a");
+		CREATE INDEX "t_a_covering_idx" ON "t" ("a") INCLUDE ("b");
+	`);
+
+	const { tables } = await fromDatabase(pgliteDb(client), () => true, ['public']);
+
+	expect(tables['public.t'].indexes['t_a_idx'].columns.map((it) => it.expression)).toStrictEqual(['a']);
+	expect(tables['public.t'].indexes['t_a_covering_idx'].columns.map((it) => [it.expression, it.opclass]))
+		.toStrictEqual([['a', 'int4_ops'], ['b', undefined]]);
+});

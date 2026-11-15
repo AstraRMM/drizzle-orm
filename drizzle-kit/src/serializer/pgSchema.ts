@@ -914,8 +914,10 @@ export function normalizePgPushSchema<T extends PgSchema>(
 	const truncated = truncatePgSchemaIdentifiers(json);
 	const withStoredCache = <S extends { cache?: string }>(seq: S, dbSeq: { cache?: string } | undefined): S => {
 		if (!dbSeq || seq.cache === dbSeq.cache) return seq;
-		const stored = (cache: string | undefined) => String(Math.max(Number(cache ?? '1'), sequenceCacheMinimum));
-		return stored(seq.cache) === stored(dbSeq.cache) ? { ...seq, cache: dbSeq.cache } : seq;
+		const requested = Number(seq.cache ?? '1');
+		const stored = Number(dbSeq.cache ?? '1');
+		const same = stored === requested || stored === Math.max(requested, sequenceCacheMinimum);
+		return same ? { ...seq, cache: dbSeq.cache } : seq;
 	};
 	return {
 		...truncated,
