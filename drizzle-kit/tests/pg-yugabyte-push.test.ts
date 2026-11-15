@@ -1,4 +1,5 @@
 import { preparePgPush } from 'src/cli/commands/migrate';
+import { pgSequenceCacheMinimum } from 'src/serializer/pgSerializer';
 import { expect, test } from 'vitest';
 
 type Idx = { name: string; columns: string[]; method: string; isUnique?: boolean; opclass?: string };
@@ -199,4 +200,31 @@ test('push compares caches exactly with a YugabyteDB minimum of 0', async () => 
 	const { sqlStatements } = await preparePgPush(sequenced('1'), sequenced('100'), { sequenceCacheMinimum: 0 });
 
 	expect(sqlStatements.some((it) => it.includes('"decisions"') && it.includes('SET CACHE 1'))).toBe(true);
+});
+
+test('the YugabyteDB cache minimum comes from YSQL_SEQUENCE_CACHE_MINVAL when it is a whole number', async () => {
+	const server = (version: string) => ({ query: async () => [{ version }] as any[] });
+	const yugabyte = server('PostgreSQL 15.12-YB-2025.2.5.2-b0 on x86_64-pc-linux-gnu');
+	const configured = process.env.YSQL_SEQUENCE_CACHE_MINVAL;
+	const minimumWith = async (value: string | undefined) => {
+		if (value === undefined) delete process.env.YSQL_SEQUENCE_CACHE_MINVAL;
+		else process.env.YSQL_SEQUENCE_CACHE_MINVAL = value;
+		return pgSequenceCacheMinimum(yugabyte);
+	};
+
+	try {
+		expect(await minimumWith(undefined)).toBe(100);
+		expect(await minimumWith('')).toBe(100);
+		expect(await minimumWith('  ')).toBe(100);
+		expect(await minimumWith('0')).toBe(0);
+		expect(await minimumWith(' 250 ')).toBe(250);
+		expect(await minimumWith('1e3')).toBe(100);
+		expect(await minimumWith('-5')).toBe(100);
+		expect(await minimumWith('many')).toBe(100);
+		process.env.YSQL_SEQUENCE_CACHE_MINVAL = '250';
+		expect(await pgSequenceCacheMinimum(server('PostgreSQL 17.10 on x86_64-pc-linux-musl'))).toBe(1);
+	} finally {
+		if (configured === undefined) delete process.env.YSQL_SEQUENCE_CACHE_MINVAL;
+		else process.env.YSQL_SEQUENCE_CACHE_MINVAL = configured;
+	}
 });

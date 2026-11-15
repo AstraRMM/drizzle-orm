@@ -1019,12 +1019,11 @@ function prepareRoles(entities?: {
 }
 
 // YugabyteDB stores a sequence cache below ysql_sequence_cache_minval (100 by default) as that minimum.
-// SQL cannot read that server flag, so a cluster with another value sets YSQL_SEQUENCE_CACHE_MINVAL.
 export const pgSequenceCacheMinimum = async (db: DB): Promise<number> => {
 	const [row] = await db.query<{ version: string }>('select version() as version');
 	if (!/-YB-/.test(row?.version ?? '')) return 1;
-	const configured = Number(process.env.YSQL_SEQUENCE_CACHE_MINVAL);
-	return Number.isInteger(configured) && configured >= 0 ? configured : 100;
+	const configured = process.env.YSQL_SEQUENCE_CACHE_MINVAL?.trim() ?? '';
+	return /^\d+$/.test(configured) ? Number(configured) : 100;
 };
 
 export const fromDatabase = async (
@@ -2212,9 +2211,9 @@ ORDER BY ns.nspname, cls.relname, a.attnum;`,
         LEFT JOIN pg_attribute AS a ON i.indrelid = a.attrelid AND k.attnum = a.attnum
         JOIN pg_namespace c on c.oid = t.relnamespace
         LEFT JOIN pg_am AS am ON ic.relam = am.oid
-        -- The operator class of this key column. INCLUDE columns have none and stay listed.
-        LEFT JOIN pg_opclass opc ON opc.oid = i.indclass[k.i - 1] AND k.i <= i.indnkeyatts
+        LEFT JOIN pg_opclass opc ON opc.oid = i.indclass[k.i - 1]
       WHERE ${inSchemas('c.nspname')}
+        AND k.i <= COALESCE((to_jsonb(i)->>'indnkeyatts')::int, i.indnatts)
       ORDER BY c.nspname, t.relname, ic.relname, k.i;`,
 	);
 

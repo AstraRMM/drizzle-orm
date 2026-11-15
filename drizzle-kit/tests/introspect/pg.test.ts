@@ -1176,7 +1176,7 @@ test('introspect keeps the key order of a composite unique constraint', async ()
 	expect(tables['public.t'].uniqueConstraints['t_c_a_unique'].columns).toStrictEqual(['c', 'a']);
 });
 
-test('introspect lists the INCLUDE columns of an index', async () => {
+test('introspect leaves the INCLUDE columns out of an index', async () => {
 	const client = new PGlite();
 
 	await client.exec(`
@@ -1189,5 +1189,5 @@ test('introspect lists the INCLUDE columns of an index', async () => {
 
 	expect(tables['public.t'].indexes['t_a_idx'].columns.map((it) => it.expression)).toStrictEqual(['a']);
 	expect(tables['public.t'].indexes['t_a_covering_idx'].columns.map((it) => [it.expression, it.opclass]))
-		.toStrictEqual([['a', 'int4_ops'], ['b', undefined]]);
+		.toStrictEqual([['a', 'int4_ops']]);
 });
