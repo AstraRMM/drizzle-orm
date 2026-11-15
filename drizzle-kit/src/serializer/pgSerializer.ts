@@ -1289,9 +1289,7 @@ WHERE
 
 					const tableConstraints = catalog.constraints.get(tableKey) ?? [];
 
-
 					const tableChecks = catalog.checks.get(tableKey) ?? [];
-
 
 					columnsCount += tableResponse.length;
 					if (progressCallback) {
@@ -1299,7 +1297,6 @@ WHERE
 					}
 
 					const tableForeignKeys = catalog.foreignKeys.get(tableKey) ?? [];
-
 
 					foreignKeysCount += tableForeignKeys.length;
 					if (progressCallback) {
@@ -1539,9 +1536,7 @@ WHERE
 
 					const dbIndexes = catalog.indexes.get(tableKey) ?? [];
 
-
 					const dbIndexFromConstraint = catalog.indexesFromConstraints.get(tableKey) ?? [];
-
 
 					const idxsInConsteraint = dbIndexFromConstraint.filter((it) => it.generated_by_constraint === 1).map((it) =>
 						it.index_name
@@ -1991,7 +1986,6 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 		return `${columnDefaultAsString.replace(/\\/g, '`\\')}`;
 	}
 };
-
 
 type CatalogRow = Record<string, any> & { _schema: string; _table: string };
 
