@@ -8,6 +8,7 @@ import {
 	check,
 	date,
 	doublePrecision,
+	foreignKey,
 	index,
 	integer,
 	interval,
@@ -29,6 +30,7 @@ import {
 	text,
 	time,
 	timestamp,
+	unique,
 	uniqueIndex,
 	uuid,
 	varchar,
@@ -4409,4 +4411,549 @@ test('alter inherit in role', async (t) => {
 	for (const st of sqlStatements) {
 		await client.query(st);
 	}
+});
+
+test('push: composite fk with ON DELETE SET NULL (column list) does not produce changes', async () => {
+	const client = new PGlite();
+
+	const users = pgTable('users', {
+		orgId: integer('org_id').notNull(),
+		id: integer('id').notNull(),
+	}, (t) => [primaryKey({ columns: [t.orgId, t.id] })]);
+
+	const posts = pgTable('posts', {
+		id: integer('id').primaryKey(),
+		orgId: integer('org_id').notNull(),
+		authorId: integer('author_id'),
+		editorId: integer('editorId'),
+	}, (t) => [
+		foreignKey({
+			name: 'posts_author_fk',
+			columns: [t.orgId, t.authorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set null (author_id)'),
+		foreignKey({
+			name: 'posts_editor_fk',
+			columns: [t.orgId, t.editorId],
+			foreignColumns: [users.orgId, users.id],
+		}).onDelete('set default ("editorId")'),
+	]);
+
+	const schema = { users, posts };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(statements.length).toBe(0);
+	expect(sqlStatements.length).toBe(0);
+});
+
+test('push: unique index referenced by a foreign key from another table does not produce changes', async () => {
+	const client = new PGlite();
+
+	const accounts = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+	}, (t) => [uniqueIndex('accounts_slug_idx').on(t.slug)]);
+
+	const memberships = pgTable('memberships', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+	}, (t) => [
+		foreignKey({
+			name: 'memberships_account_slug_fk',
+			columns: [t.accountSlug],
+			foreignColumns: [accounts.slug],
+		}),
+	]);
+
+	const schema = { accounts, memberships };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
+});
+
+test('push: ON DELETE SET NULL column lists compare by column, not by spelling', async () => {
+	const client = new PGlite();
+
+	const parents = pgTable('parents', {
+		orgId: integer('org_id').notNull(),
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+	}, (t) => [
+		primaryKey({ columns: [t.orgId, t.x, t.y] }),
+		unique('parents_org_x_unique').on(t.orgId, t.x),
+	]);
+
+	const children = pgTable('children', {
+		id: integer('id').primaryKey(),
+		orgId: integer('org_id').notNull(),
+		a: integer('a'),
+		b: integer('b'),
+		position: integer('position'),
+	}, (t) => [
+		// `position` is a keyword that quote_ident() quotes although it is legal unquoted here.
+		foreignKey({
+			name: 'children_position_fk',
+			columns: [t.orgId, t.position],
+			foreignColumns: [parents.orgId, parents.x],
+		}).onDelete('set null (position)'),
+		// Two columns, listed in a different order from the table, with odd spacing and case.
+		foreignKey({
+			name: 'children_ab_fk',
+			columns: [t.orgId, t.a, t.b],
+			foreignColumns: [parents.orgId, parents.x, parents.y],
+		}).onDelete('SET NULL (B,"a")'),
+	]);
+
+	const schema = { parents, children };
+
+	// Composite FKs that target a composite primary key are created by hand so that the
+	// referenced constraint exists first.
+	const { statements, sqlStatements } = await diffTestSchemasPush(
+		client,
+		schema,
+		schema,
+		[],
+		false,
+		['public'],
+		undefined,
+		undefined,
+		{
+			before: [
+				'CREATE TABLE "parents" ("org_id" integer NOT NULL, "x" integer NOT NULL, "y" integer NOT NULL, CONSTRAINT "parents_org_id_x_y_pk" PRIMARY KEY ("org_id", "x", "y"), CONSTRAINT "parents_org_x_unique" UNIQUE ("org_id", "x"));',
+				'CREATE TABLE "children" ("id" integer PRIMARY KEY NOT NULL, "org_id" integer NOT NULL, "a" integer, "b" integer, "position" integer, CONSTRAINT "children_position_fk" FOREIGN KEY ("org_id", "position") REFERENCES "parents"("org_id", "x") ON DELETE SET NULL (position), CONSTRAINT "children_ab_fk" FOREIGN KEY ("org_id", "a", "b") REFERENCES "parents"("org_id", "x", "y") ON DELETE SET NULL (b, a));',
+			],
+			runApply: false,
+		},
+	);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
+});
+
+test('push: unique index referenced by a self-referencing foreign key does not produce changes', async () => {
+	const client = new PGlite();
+
+	const nodes = pgTable('nodes', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+		parentSlug: text('parent_slug'),
+	}, (t) => [
+		uniqueIndex('nodes_slug_idx').on(t.slug),
+		foreignKey({
+			name: 'nodes_parent_slug_fk',
+			columns: [t.parentSlug],
+			foreignColumns: [t.slug],
+		}),
+	]);
+
+	const schema = { nodes };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
+});
+
+test('generate: foreign keys are created after the unique index and unique constraint they reference', async () => {
+	const client = new PGlite();
+
+	const accounts1 = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+		code: text('code').notNull(),
+	});
+
+	const members1 = pgTable('members', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+		accountCode: text('account_code').notNull(),
+	});
+
+	const accounts2 = pgTable('accounts', {
+		id: integer('id').primaryKey(),
+		slug: text('slug').notNull(),
+		code: text('code').notNull(),
+	}, (t) => [uniqueIndex('accounts_slug_idx').on(t.slug), unique('accounts_code_unique').on(t.code)]);
+
+	const members2 = pgTable('members', {
+		id: integer('id').primaryKey(),
+		accountSlug: text('account_slug').notNull(),
+		accountCode: text('account_code').notNull(),
+	}, (t) => [
+		foreignKey({ name: 'members_slug_fk', columns: [t.accountSlug], foreignColumns: [accounts2.slug] }),
+		foreignKey({ name: 'members_code_fk', columns: [t.accountCode], foreignColumns: [accounts2.code] }),
+	]);
+
+	// Existing tables gain the unique index, the unique constraint and the foreign keys in one step.
+	const altered = await diffTestSchemas({ accounts: accounts1, members: members1 }, {
+		accounts: accounts2,
+		members: members2,
+	}, []);
+	// New tables get everything at once.
+	const created = await diffTestSchemas({}, { accounts: accounts2, members: members2 }, []);
+
+	for (const { sqlStatements } of [altered, created]) {
+		const fkAt = sqlStatements.findIndex((it) => it.includes('"members_slug_fk"'));
+		const indexAt = sqlStatements.findIndex((it) => it.includes('"accounts_slug_idx"'));
+		const uniqueAt = sqlStatements.findIndex((it) => it.includes('"accounts_code_unique"'));
+		expect(fkAt).toBeGreaterThan(indexAt);
+		expect(fkAt).toBeGreaterThan(uniqueAt);
+	}
+
+	const { sqlStatements: initial } = await diffTestSchemas({}, { accounts: accounts1, members: members1 }, []);
+	for (const st of [...initial, ...altered.sqlStatements]) {
+		await client.query(st);
+	}
+
+	const fresh = new PGlite();
+	for (const st of created.sqlStatements) {
+		await fresh.query(st);
+	}
+});
+
+test('push: composite foreign key whose columns are not in table order does not produce changes', async () => {
+	const client = new PGlite();
+
+	const parents = pgTable('parents', {
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+	}, (t) => [primaryKey({ columns: [t.x, t.y] })]);
+
+	const children = pgTable('children', {
+		id: integer('id').primaryKey(),
+		a: integer('a'),
+		b: integer('b'),
+	}, (t) => [
+		// b -> x and a -> y; introspection used to pair a -> x and b -> y.
+		foreignKey({ name: 'children_parent_fk', columns: [t.b, t.a], foreignColumns: [parents.x, parents.y] }),
+	]);
+
+	const schema = { parents, children };
+
+	const { statements, sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+	expect(statements.length).toBe(0);
+});
+
+function keysReferencedByForeignKeys(version: 1 | 2) {
+	const parents = pgTable('parents', {
+		x: integer('x').notNull(),
+		y: integer('y').notNull(),
+		code: text('code').notNull(),
+		slug: text('slug').notNull(),
+	}, (t) => [
+		// The primary key changes column order, the unique constraint changes NULLS NOT DISTINCT and
+		// the unique index is renamed. Each is dropped and re-created while a foreign key needs it.
+		primaryKey({ name: 'parents_pk', columns: version === 1 ? [t.x, t.y] : [t.y, t.x] }),
+		version === 1
+			? unique('parents_code_unique').on(t.code)
+			: unique('parents_code_unique').on(t.code).nullsNotDistinct(),
+		uniqueIndex(version === 1 ? 'parents_slug_idx' : 'parents_slug_uidx').on(t.slug),
+	]);
+
+	const others = pgTable('others', { id: integer('id').primaryKey() });
+
+	const children = pgTable('children', {
+		id: integer('id').primaryKey(),
+		a: integer('a'),
+		b: integer('b'),
+		code: text('code'),
+		slug: text('slug'),
+		otherId: integer('other_id'),
+	}, (t) => [
+		foreignKey({ name: 'children_pk_fk', columns: [t.a, t.b], foreignColumns: [parents.x, parents.y] }),
+		foreignKey({ name: 'children_code_fk', columns: [t.code], foreignColumns: [parents.code] }),
+		foreignKey({ name: 'children_slug_fk', columns: [t.slug], foreignColumns: [parents.slug] }),
+		foreignKey({ name: 'children_other_fk', columns: [t.otherId], foreignColumns: [others.id] }),
+	]);
+
+	return { parents, others, children };
+}
+
+function expectForeignKeysAroundDroppedKeys(sqlStatements: string[]) {
+	const keys: Record<string, string> = {
+		children_pk_fk: 'DROP CONSTRAINT "parents_pk"',
+		children_code_fk: 'DROP CONSTRAINT "parents_code_unique"',
+		children_slug_fk: 'DROP INDEX "parents_slug_idx"',
+	};
+	let checked = 0;
+	for (const [fk, dropKey] of Object.entries(keys)) {
+		const keyAt = sqlStatements.findIndex((it) => it.includes(dropKey));
+		if (keyAt === -1) continue;
+		checked++;
+		const dropAt = sqlStatements.findIndex((it) => it.includes(`DROP CONSTRAINT "${fk}"`));
+		const addAt = sqlStatements.findIndex((it) => it.includes(`ADD CONSTRAINT "${fk}"`));
+		expect(dropAt, fk).toBeGreaterThanOrEqual(0);
+		expect(dropAt, fk).toBeLessThan(keyAt);
+		expect(addAt, fk).toBeGreaterThan(keyAt);
+	}
+	// A foreign key to an unchanged key is left alone.
+	expect(sqlStatements.some((it) => it.includes('children_other_fk'))).toBe(false);
+	return checked;
+}
+
+async function expectDatabaseMatches(client: PGlite, schema: Record<string, unknown>) {
+	const { sqlStatements } = await diffTestSchemasPush(
+		client,
+		schema as any,
+		schema as any,
+		[],
+		false,
+		['public'],
+		undefined,
+		undefined,
+		{ runApply: false },
+	);
+	expect(sqlStatements).toStrictEqual([]);
+}
+
+test('generate: foreign keys are re-created around a primary key, unique constraint or unique index that is re-created', async () => {
+	const client = new PGlite();
+	const schema1 = keysReferencedByForeignKeys(1);
+	const schema2 = keysReferencedByForeignKeys(2);
+
+	const { sqlStatements: initial } = await diffTestSchemas({}, schema1, []);
+	for (const st of initial) await client.exec(st);
+
+	const { sqlStatements } = await diffTestSchemas(schema1, schema2, []);
+
+	// All three keys change in generate.
+	expect(expectForeignKeysAroundDroppedKeys(sqlStatements)).toBe(3);
+
+	// Statements can hold several commands separated by breakpoints, as the migrator runs them.
+	for (const st of sqlStatements) await client.exec(st);
+	await expectDatabaseMatches(client, schema2);
+});
+
+test('push: foreign keys are re-created around a primary key, unique constraint or unique index that is re-created', async () => {
+	const client = new PGlite();
+	const schema1 = keysReferencedByForeignKeys(1);
+	const schema2 = keysReferencedByForeignKeys(2);
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema1, schema2, [], false, ['public']);
+
+	expect(expectForeignKeysAroundDroppedKeys(sqlStatements)).toBe(3);
+
+	for (const st of sqlStatements) await client.exec(st);
+	await expectDatabaseMatches(client, schema2);
+});
+
+test('generate: a foreign key is not dropped when the key it needs is removed without a replacement', async () => {
+	const parents1 = pgTable('parents', {
+		id: integer('id').primaryKey(),
+		code: text('code').notNull(),
+	}, (t) => [unique('parents_code_unique').on(t.code)]);
+	const parents2 = pgTable('parents', {
+		id: integer('id').primaryKey(),
+		code: text('code').notNull(),
+	});
+	const children = (parents: typeof parents1) =>
+		pgTable('children', {
+			id: integer('id').primaryKey(),
+			code: text('code'),
+		}, (t) => [foreignKey({ name: 'children_code_fk', columns: [t.code], foreignColumns: [parents.code] })]);
+
+	const { sqlStatements } = await diffTestSchemas(
+		{ parents: parents1, children: children(parents1) },
+		{ parents: parents2, children: children(parents2) },
+		[],
+	);
+
+	// The unique constraint is still dropped, and PostgreSQL rejects that because of the foreign key,
+	// before anything else changes. Dropping the foreign key here would leave it impossible to re-create.
+	expect(sqlStatements.some((it) => it.includes('DROP CONSTRAINT "parents_code_unique"'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('children_code_fk'))).toBe(false);
+});
+
+test('push: dropping a partial unique index does not re-create foreign keys on the same columns', async () => {
+	const client = new PGlite();
+
+	const parents = (withPartial: boolean) =>
+		pgTable('parents', {
+			id: integer('id').primaryKey(),
+			code: text('code').notNull(),
+			active: boolean('active').notNull(),
+		}, (t) => [
+			unique('parents_code_unique').on(t.code),
+			...(withPartial ? [uniqueIndex('parents_active_code_idx').on(t.code).where(sql`${t.active}`)] : []),
+		]);
+	const children = (p: ReturnType<typeof parents>) =>
+		pgTable('children', {
+			id: integer('id').primaryKey(),
+			code: text('code'),
+		}, (t) => [foreignKey({ name: 'children_code_fk', columns: [t.code], foreignColumns: [p.code] })]);
+
+	const parents1 = parents(true);
+	const parents2 = parents(false);
+	const { sqlStatements } = await diffTestSchemasPush(
+		client,
+		{ parents: parents1, children: children(parents1) },
+		{ parents: parents2, children: children(parents2) },
+		[],
+		false,
+		['public'],
+	);
+
+	expect(sqlStatements.some((it) => it.includes('DROP INDEX "parents_active_code_idx"'))).toBe(true);
+	expect(sqlStatements.some((it) => it.includes('children_code_fk'))).toBe(false);
+});
+
+const longNamedTables = (withChildForeignKey: boolean) => {
+	const parent = pgTable('trunc_parent', {
+		tenantIdentifier: integer('tenant_identifier_for_partitioning').notNull(),
+		recordIdentifier: integer('record_identifier_within_the_tenant').notNull(),
+		externalReference: text('external_reference_supplied_by_the_caller').notNull(),
+		sortKey: integer('sort_key_for_listing_records_in_order'),
+	}, (t) => [
+		primaryKey({ columns: [t.tenantIdentifier, t.recordIdentifier] }),
+		unique().on(t.tenantIdentifier, t.externalReference),
+		index().on(t.tenantIdentifier, t.sortKey),
+		uniqueIndex().on(t.externalReference, t.sortKey),
+		check(
+			'trunc_parent_sort_key_for_listing_records_in_order_must_be_positive',
+			sql`${t.sortKey} > 0`,
+		),
+	]);
+	const child = pgTable('trunc_child', {
+		id: integer('id').primaryKey(),
+		tenantIdentifier: integer('tenant_identifier_for_partitioning').notNull(),
+		recordIdentifier: integer('record_identifier_within_the_tenant').notNull(),
+	}, (t) =>
+		withChildForeignKey
+			? [
+				foreignKey({
+					columns: [t.tenantIdentifier, t.recordIdentifier],
+					foreignColumns: [parent.tenantIdentifier, parent.recordIdentifier],
+				}).onDelete('cascade'),
+			]
+			: []);
+	return { parent, child };
+};
+
+test('push: indexes and constraints whose names exceed 63 bytes do not produce changes', async () => {
+	const client = new PGlite();
+	const schema = longNamedTables(true);
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+
+	// The database really holds the truncated names the schema is compared under.
+	const { rows } = await client.query<{ name: string }>(
+		`SELECT conname AS name FROM pg_constraint WHERE conrelid::regclass::text LIKE 'trunc_%'
+		 UNION ALL
+		 SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid::regclass::text LIKE 'trunc_%'`,
+	);
+	const truncated = rows.map((it) => it.name.replaceAll('"', '')).filter((it) => it.length === 63);
+	expect(truncated.length).toBeGreaterThanOrEqual(8);
+});
+
+test('push: a new constraint with a name over 63 bytes is added under the name PostgreSQL stores, then settles', async () => {
+	const client = new PGlite();
+	const before = longNamedTables(false);
+	const after = longNamedTables(true);
+
+	const { sqlStatements } = await diffTestSchemasPush(client, before, after, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([
+		'ALTER TABLE "trunc_child" ADD CONSTRAINT "trunc_child_tenant_identifier_for_partitioning_record_identifie" FOREIGN KEY ("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") REFERENCES "public"."trunc_parent"("tenant_identifier_for_partitioning","record_identifier_within_the_tenant") ON DELETE cascade ON UPDATE no action;',
+	]);
+	for (const statement of sqlStatements) await client.exec(statement);
+
+	const second = await diffTestSchemasPush(client, after, after, [], false, ['public'], undefined, undefined, {
+		runApply: false,
+	});
+	expect(second.sqlStatements).toStrictEqual([]);
+});
+
+test('push: SQL defaults that PostgreSQL rewrites do not produce changes', async () => {
+	const client = new PGlite();
+	const schema = {
+		counters: pgTable('counters', {
+			id: integer('id').primaryKey(),
+			reserved: bigint('reserved', { mode: 'bigint' }).notNull().default(sql`0`),
+			sequence: bigint('sequence', { mode: 'bigint' }).notNull().default(sql`-1`),
+			generation: integer('generation').notNull().default(sql`1`),
+			uuid: text('uuid').notNull().default(sql`gen_random_uuid()::text`),
+			tags: text('tags').array().notNull().default(sql`ARRAY[]::text[]`),
+		}),
+	};
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push: changing a SQL default is still detected', async () => {
+	const client = new PGlite();
+	const table = (value: number) => ({
+		counters: pgTable('counters', {
+			id: integer('id').primaryKey(),
+			generation: integer('generation').notNull().default(sql.raw(String(value))),
+		}),
+	});
+
+	const { sqlStatements } = await diffTestSchemasPush(client, table(1), table(2), [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual(['ALTER TABLE "counters" ALTER COLUMN "generation" SET DEFAULT 2;']);
+});
+
+test('push: single-column primary key declared with primaryKey({ name }) does not produce changes', async () => {
+	const client = new PGlite();
+	const schema = {
+		deliveries: pgTable('deliveries', {
+			sourceEventId: text('source_event_id').notNull(),
+			attempts: integer('attempts').notNull(),
+		}, (t) => [primaryKey({ columns: [t.sourceEventId], name: 'delivery_source_event_pk' })]),
+		plain: pgTable('plain', { id: integer('id').primaryKey() }),
+	};
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push: indexes mixing expressions with columns, and ordering inside raw SQL, do not produce changes', async () => {
+	const client = new PGlite();
+	const schema = {
+		events: pgTable('events', {
+			id: text('id').primaryKey(),
+			repositoryId: text('repository_id').notNull(),
+			status: text('status').notNull(),
+			updatedAt: timestamp('updated_at').notNull(),
+			subjectType: text('subject_type').notNull(),
+			payload: jsonb('payload').notNull(),
+		}, (t) => [
+			index('events_opaque_idx').on(sql`substr(md5(${t.repositoryId}), 1, 16)`, t.status, t.updatedAt),
+			index('events_owner_idx').on(sql`(${t.payload}->>'tenantId')`, sql`(${t.payload}->>'ownerId')`, t.updatedAt, t.id)
+				.where(sql`${t.subjectType} = 'remote_host'`),
+			index('events_timeline_idx').on(
+				sql.raw("coalesce(payload->>'occurredAt', '') desc"),
+				sql.raw('id desc'),
+			),
+		]),
+	};
+
+	const { sqlStatements } = await diffTestSchemasPush(client, schema, schema, [], false, ['public']);
+
+	expect(sqlStatements).toStrictEqual([]);
+});
+
+test('push: changing the ordering of an expression index column is still detected', async () => {
+	const client = new PGlite();
+	const table = (direction: 'asc' | 'desc') => ({
+		events: pgTable('events', {
+			id: text('id').primaryKey(),
+			payload: jsonb('payload').notNull(),
+		}, (t) => [index('events_timeline_idx').on(sql.raw(`coalesce(payload->>'occurredAt', '') ${direction}`))]),
+	});
+
+	const { sqlStatements } = await diffTestSchemasPush(client, table('asc'), table('desc'), [], false, ['public']);
+
+	expect(sqlStatements.some((it) => it.startsWith('DROP INDEX "events_timeline_idx"'))).toBe(true);
+	expect(sqlStatements.some((it) => it.startsWith('CREATE INDEX "events_timeline_idx"'))).toBe(true);
 });

@@ -43,6 +43,59 @@ import type {
 import { type DB, escapeSingleQuotes, isPgArrayType } from '../utils';
 import { getColumnCasing, sqlToStr } from './utils';
 
+/**
+ * Brings an `ON DELETE` action to one spelling so the schema and the database compare equal.
+ * PostgreSQL 15+ column lists (`set null (a, b)`) are rewritten with every column quoted and
+ * unquoted names folded to lower case, the way PostgreSQL resolves them:
+ * `SET NULL (Author_Id,"editorId")` becomes `set null ("author_id", "editorId")`.
+ * Other actions, and lists that cannot be parsed, are returned unchanged.
+ */
+export function normalizePgDeleteAction(action: string | undefined): string | undefined {
+	if (action === undefined) return action;
+	const match = /^\s*(set\s+null|set\s+default)\s*\((.*)\)\s*$/is.exec(action);
+	if (!match) return action;
+
+	const names: string[] = [];
+	const list = match[2]!;
+	let i = 0;
+	while (i < list.length) {
+		while (i < list.length && /\s/.test(list[i]!)) i++;
+		let name = '';
+		if (list[i] === '"') {
+			i++;
+			for (;;) {
+				if (i >= list.length) return action;
+				if (list[i] === '"') {
+					if (list[i + 1] === '"') {
+						name += '"';
+						i += 2;
+						continue;
+					}
+					i++;
+					break;
+				}
+				name += list[i++];
+			}
+			while (i < list.length && /\s/.test(list[i]!)) i++;
+		} else {
+			const start = i;
+			while (i < list.length && list[i] !== ',') i++;
+			name = list.slice(start, i).trim().toLowerCase();
+			if (name === '' || /[\s"]/.test(name)) return action;
+		}
+		names.push(name);
+		if (i < list.length) {
+			if (list[i] !== ',') return action;
+			i++;
+			if (i >= list.length) return action;
+		}
+	}
+	if (names.length === 0) return action;
+
+	const keyword = match[1]!.toLowerCase().replace(/\s+/g, ' ');
+	return `${keyword} (${names.map((name) => `"${name.replace(/"/g, '""')}"`).join(', ')})`;
+}
+
 export const indexName = (tableName: string, columns: string[]) => {
 	return `${tableName}_${columns.join('_')}_index`;
 };
@@ -324,7 +377,7 @@ export const generatePgSnapshot = (
 
 		const fks: ForeignKey[] = foreignKeys.map((fk) => {
 			const tableFrom = tableName;
-			const onDelete = fk.onDelete;
+			const onDelete = normalizePgDeleteAction(fk.onDelete);
 			const onUpdate = fk.onUpdate;
 			const reference = fk.reference();
 
@@ -965,6 +1018,14 @@ function prepareRoles(entities?: {
 	return { useRoles, includeRoles, excludeRoles };
 }
 
+// YugabyteDB stores a sequence cache below ysql_sequence_cache_minval (100 by default) as that minimum.
+export const pgSequenceCacheMinimum = async (db: DB): Promise<number> => {
+	const [row] = await db.query<{ version: string }>('select version() as version');
+	if (!/-YB-/.test(row?.version ?? '')) return 1;
+	const configured = process.env.YSQL_SEQUENCE_CACHE_MINVAL?.trim() ?? '';
+	return /^\d+$/.test(configured) ? Number(configured) : 100;
+};
+
 export const fromDatabase = async (
 	db: DB,
 	tablesFilter: (table: string) => boolean = () => true,
@@ -1039,10 +1100,17 @@ WHERE
 
 	const seqWhere = schemaFilters.map((t) => `schemaname = '${t}'`).join(' or ');
 
-	const allSequences = await db.query(
-		`select schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle, cache_size from pg_sequences as seq${
-			seqWhere === '' ? '' : ` WHERE ${seqWhere}`
-		};`,
+	const allSequences = (await db.query(
+		`select schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle, cache_size,
+		(select owner.relname from pg_catalog.pg_depend dep
+			join pg_catalog.pg_class owner on owner.oid = dep.refobjid
+			where dep.classid = 'pg_catalog.pg_class'::regclass and dep.objid = format('%I.%I', schemaname, sequencename)::regclass
+				and dep.refclassid = 'pg_catalog.pg_class'::regclass and dep.deptype in ('a', 'i')
+			limit 1) as owner_table
+		from pg_sequences as seq${seqWhere === '' ? '' : ` WHERE ${seqWhere}`};`,
+	)).filter((seq) =>
+		seq.owner_table === null || seq.owner_table === undefined || tablesFilter(seq.owner_table)
+		|| tsSchema?.sequences[`${seq.schemaname}.${seq.sequencename}`] !== undefined
 	);
 
 	for (const dbSeq of allSequences) {
@@ -1208,6 +1276,8 @@ WHERE
 
 	const sequencesInColumns: string[] = [];
 
+	const catalog = await readTableCatalog(db, [...new Set(allTables.map((it) => it.table_schema))]);
+
 	const all = allTables
 		.filter((it) => it.type === 'table')
 		.map((row) => {
@@ -1225,85 +1295,19 @@ WHERE
 					const uniqueConstrains: Record<string, UniqueConstraint> = {};
 					const checkConstraints: Record<string, CheckConstraint> = {};
 
-					const tableResponse = await getColumnsInfoQuery({ schema: tableSchema, table: tableName, db });
+					const tableKey = `${tableSchema}.${tableName}`;
+					const tableResponse = catalog.columns.get(tableKey) ?? [];
 
-					const tableConstraints = await db.query(
-						`SELECT c.column_name, c.data_type, constraint_type, constraint_name, constraint_schema
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
-      JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
-        AND tc.table_name = c.table_name AND ccu.column_name = c.column_name
-      WHERE tc.table_name = '${tableName}' and constraint_schema = '${tableSchema}';`,
-					);
+					const tableConstraints = catalog.constraints.get(tableKey) ?? [];
 
-					const tableChecks = await db.query(`SELECT 
-						tc.constraint_name,
-						tc.constraint_type,
-						pg_get_constraintdef(con.oid) AS constraint_definition
-					FROM 
-						information_schema.table_constraints AS tc
-						JOIN pg_constraint AS con 
-							ON tc.constraint_name = con.conname
-							AND con.conrelid = (
-								SELECT oid 
-								FROM pg_class 
-								WHERE relname = tc.table_name 
-								AND relnamespace = (
-									SELECT oid 
-									FROM pg_namespace 
-									WHERE nspname = tc.constraint_schema
-								)
-							)
-					WHERE 
-						tc.table_name = '${tableName}'
-						AND tc.constraint_schema = '${tableSchema}'
-						AND tc.constraint_type = 'CHECK'
-						AND con.contype = 'c';`);
+					const tableChecks = catalog.checks.get(tableKey) ?? [];
 
 					columnsCount += tableResponse.length;
 					if (progressCallback) {
 						progressCallback('columns', columnsCount, 'fetching');
 					}
 
-					const tableForeignKeys = await db.query(
-						`SELECT
-            con.contype AS constraint_type,
-            nsp.nspname AS constraint_schema,
-            con.conname AS constraint_name,
-            rel.relname AS table_name,
-            att.attname AS column_name,
-            fnsp.nspname AS foreign_table_schema,
-            frel.relname AS foreign_table_name,
-            fatt.attname AS foreign_column_name,
-            CASE con.confupdtype
-              WHEN 'a' THEN 'NO ACTION'
-              WHEN 'r' THEN 'RESTRICT'
-              WHEN 'n' THEN 'SET NULL'
-              WHEN 'c' THEN 'CASCADE'
-              WHEN 'd' THEN 'SET DEFAULT'
-            END AS update_rule,
-            CASE con.confdeltype
-              WHEN 'a' THEN 'NO ACTION'
-              WHEN 'r' THEN 'RESTRICT'
-              WHEN 'n' THEN 'SET NULL'
-              WHEN 'c' THEN 'CASCADE'
-              WHEN 'd' THEN 'SET DEFAULT'
-            END AS delete_rule
-          FROM
-            pg_catalog.pg_constraint con
-            JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
-            JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace
-            LEFT JOIN pg_catalog.pg_attribute att ON att.attnum = ANY (con.conkey)
-              AND att.attrelid = con.conrelid
-            LEFT JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid
-            LEFT JOIN pg_catalog.pg_namespace fnsp ON fnsp.oid = frel.relnamespace
-            LEFT JOIN pg_catalog.pg_attribute fatt ON fatt.attnum = ANY (con.confkey)
-              AND fatt.attrelid = con.confrelid
-          WHERE
-            nsp.nspname = '${tableSchema}'
-            AND rel.relname = '${tableName}'
-            AND con.contype IN ('f');`,
-					);
+					const tableForeignKeys = catalog.foreignKeys.get(tableKey) ?? [];
 
 					foreignKeysCount += tableForeignKeys.length;
 					if (progressCallback) {
@@ -1317,7 +1321,13 @@ WHERE
 						const schemaTo: string = fk.foreign_table_schema;
 						const foreignKeyName = fk.constraint_name;
 						const onUpdate = fk.update_rule?.toLowerCase();
-						const onDelete = fk.delete_rule?.toLowerCase();
+						// Lowercase only the action keyword; a PostgreSQL 15+ column list (`SET NULL (col)`) keeps its identifiers.
+						const onDelete = normalizePgDeleteAction(
+							fk.delete_rule?.replace(
+								/^(NO ACTION|RESTRICT|SET NULL|CASCADE|SET DEFAULT)/,
+								(action: string) => action.toLowerCase(),
+							),
+						);
 
 						if (typeof foreignKeysToReturn[foreignKeyName] !== 'undefined') {
 							foreignKeysToReturn[foreignKeyName].columnsFrom.push(columnFrom);
@@ -1334,15 +1344,13 @@ WHERE
 								onUpdate,
 							};
 						}
-
-						foreignKeysToReturn[foreignKeyName].columnsFrom = [
-							...new Set(foreignKeysToReturn[foreignKeyName].columnsFrom),
-						];
-
-						foreignKeysToReturn[foreignKeyName].columnsTo = [...new Set(foreignKeysToReturn[foreignKeyName].columnsTo)];
 					}
 
 					const uniqueConstrainsRows = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'UNIQUE');
+
+					const uniqueNullsNotDistinct = new Set(
+						(catalog.nullsNotDistinctUniques.get(tableKey) ?? []).map((row) => row.constraint_name),
+					);
 
 					for (const unqs of uniqueConstrainsRows) {
 						// const tableFrom = fk.table_name;
@@ -1354,7 +1362,7 @@ WHERE
 						} else {
 							uniqueConstrains[constraintName] = {
 								columns: [columnName],
-								nullsNotDistinct: false,
+								nullsNotDistinct: uniqueNullsNotDistinct.has(constraintName),
 								name: constraintName,
 							};
 						}
@@ -1403,16 +1411,14 @@ WHERE
 						);
 
 						const cprimaryKey = tableConstraints.filter((mapRow) => mapRow.constraint_type === 'PRIMARY KEY');
+						// A column-level primary key always gets PostgreSQL's automatic "<table>_pkey" name.
+						// A single-column key with any other name was declared with primaryKey({ ... }).
+						const namedSingleColumnPk = cprimaryKey.length === 1
+							&& !String(cprimaryKey[0].constraint_name).endsWith('_pkey');
 
-						if (cprimaryKey.length > 1) {
-							const tableCompositePkName = await db.query(
-								`SELECT conname AS primary_key
-            FROM   pg_constraint join pg_class on (pg_class.oid = conrelid)
-            WHERE  contype = 'p' 
-            AND    connamespace = $1::regnamespace  
-            AND    pg_class.relname = $2;`,
-								[tableSchema, tableName],
-							);
+						if (cprimaryKey.length > 1 || namedSingleColumnPk) {
+							const tableCompositePkName = catalog.primaryKeys.get(tableKey) ?? [];
+
 							primaryKeys[tableCompositePkName[0].primary_key] = {
 								name: tableCompositePkName[0].primary_key,
 								columns: cprimaryKey.map((c: any) => c.column_name),
@@ -1499,7 +1505,7 @@ WHERE
 							typeSchema: enumsToReturn[`${typeSchema}.${enumType}`] !== undefined
 								? enumsToReturn[`${typeSchema}.${enumType}`].schema
 								: undefined,
-							primaryKey: primaryKey.length === 1 && cprimaryKey.length < 2,
+							primaryKey: primaryKey.length === 1 && cprimaryKey.length < 2 && !namedSingleColumnPk,
 							// default: isSerial ? undefined : defaultValue,
 							notNull: columnResponse.is_nullable === 'NO',
 							generated: isGenerated
@@ -1539,51 +1545,9 @@ WHERE
 						}
 					}
 
-					const dbIndexes = await db.query(
-						`SELECT  DISTINCT ON (t.relname, ic.relname, k.i) t.relname as table_name, ic.relname AS indexname,
-        k.i AS index_order,
-        i.indisunique as is_unique,
-        am.amname as method,
-        ic.reloptions as with,
-        coalesce(a.attname, pg_get_indexdef(i.indexrelid, k.i, false)) AS column_name,
-          CASE
-        WHEN pg_get_expr(i.indexprs, i.indrelid) IS NOT NULL THEN 1
-        ELSE 0
-    END AS is_expression,
-        i.indoption[k.i-1] & 1 = 1 AS descending,
-        i.indoption[k.i-1] & 2 = 2 AS nulls_first,
-        pg_get_expr(
-                              i.indpred,
-                              i.indrelid
-                          ) as where,
-         opc.opcname
-      FROM pg_class t
-          LEFT JOIN pg_index i ON t.oid = i.indrelid
-          LEFT JOIN pg_class ic ON ic.oid = i.indexrelid
-		  CROSS JOIN LATERAL (SELECT unnest(i.indkey), generate_subscripts(i.indkey, 1) + 1) AS k(attnum, i)
-          LEFT JOIN pg_attribute AS a
-            ON i.indrelid = a.attrelid AND k.attnum = a.attnum
-          JOIN pg_namespace c on c.oid = t.relnamespace
-        LEFT JOIN pg_am AS am ON ic.relam = am.oid
-        JOIN pg_opclass opc ON opc.oid = ANY(i.indclass)
-      WHERE
-      c.nspname = '${tableSchema}' AND
-      t.relname = '${tableName}';`,
-					);
+					const dbIndexes = catalog.indexes.get(tableKey) ?? [];
 
-					const dbIndexFromConstraint = await db.query(
-						`SELECT
-          idx.indexrelname AS index_name,
-          idx.relname AS table_name,
-          schemaname,
-          CASE WHEN con.conname IS NOT NULL THEN 1 ELSE 0 END AS generated_by_constraint
-        FROM
-          pg_stat_user_indexes idx
-        LEFT JOIN
-          pg_constraint con ON con.conindid = idx.indexrelid
-        WHERE idx.relname = '${tableName}' and schemaname = '${tableSchema}'
-        group by index_name, table_name,schemaname, generated_by_constraint;`,
-					);
+					const dbIndexFromConstraint = catalog.indexesFromConstraints.get(tableKey) ?? [];
 
 					const idxsInConsteraint = dbIndexFromConstraint.filter((it) => it.generated_by_constraint === 1).map((it) =>
 						it.index_name
@@ -1596,7 +1560,7 @@ WHERE
 						const indexMethod = dbIndex.method;
 						const indexWith: string[] = dbIndex.with;
 						const indexWhere: string = dbIndex.where;
-						const opclass: string = dbIndex.opcname;
+						const opclass: string | undefined = dbIndex.opcname ?? undefined;
 						const isExpression = dbIndex.is_expression === 1;
 
 						const desc: boolean = dbIndex.descending;
@@ -1689,7 +1653,7 @@ WHERE
 				try {
 					const columnToReturn: Record<string, Column> = {};
 
-					const viewResponses = await getColumnsInfoQuery({ schema: viewSchema, table: viewName, db });
+					const viewResponses = catalog.columns.get(`${viewSchema}.${viewName}`) ?? [];
 
 					for (const viewResponse of viewResponses) {
 						const columnName = viewResponse.column_name;
@@ -1962,6 +1926,11 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 
 	const columnDefaultAsString: string = column.column_default.toString();
 
+	// An ARRAY[...] constructor is an expression, not an array literal ('{...}').
+	if (columnDefaultAsString.startsWith('ARRAY[')) {
+		return columnDefaultAsString;
+	}
+
 	if (isArray) {
 		return `'{${
 			columnDefaultAsString
@@ -1989,6 +1958,9 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 	if (['integer', 'smallint', 'bigint', 'double precision', 'real'].includes(column.data_type)) {
 		if (/^-?[\d.]+(?:e-?\d+)?$/.test(columnDefaultAsString)) {
 			return Number(columnDefaultAsString);
+		} else if (/^'-?[\d.]+(?:e-?\d+)?'$/.test(columnDefaultAsString)) {
+			// PostgreSQL prints negative numeric constants quoted, e.g. '-1'::integer.
+			return Number(columnDefaultAsString.slice(1, -1));
 		} else {
 			if (typeof internals!.tables![tableName] === 'undefined') {
 				internals!.tables![tableName] = {
@@ -2026,27 +1998,63 @@ const defaultForColumn = (column: any, internals: PgKitInternals, tableName: str
 	}
 };
 
-const getColumnsInfoQuery = ({ schema, table, db }: { schema: string; table: string; db: DB }) => {
-	return db.query(
-		`SELECT 
-    a.attrelid::regclass::text AS table_name,  -- Table, view, or materialized view name
-    a.attname AS column_name,   -- Column name
-    CASE 
-        WHEN NOT a.attisdropped THEN 
-            CASE 
+type CatalogRow = Record<string, any> & { _schema: string; _table: string };
+
+function groupByTable(rows: CatalogRow[]): Map<string, CatalogRow[]> {
+	const grouped = new Map<string, CatalogRow[]>();
+	for (const row of rows) {
+		const key = `${row._schema}.${row._table}`;
+		const group = grouped.get(key);
+		if (group) group.push(row);
+		else grouped.set(key, [row]);
+	}
+	return grouped;
+}
+
+/**
+ * Reads the columns, constraints and indexes of every table in the given schemas with one query
+ * per kind, grouped by `schema.table`. Reading them table by table cost about eight round trips
+ * per table, which on a large schema or a distributed catalog such as YugabyteDB's took minutes.
+ */
+const readTableCatalog = async (db: DB, schemaNames: string[]) => {
+	const empty = new Map<string, CatalogRow[]>();
+	if (schemaNames.length === 0) {
+		return {
+			columns: empty,
+			constraints: empty,
+			checks: empty,
+			foreignKeys: empty,
+			nullsNotDistinctUniques: empty,
+			primaryKeys: empty,
+			indexes: empty,
+			indexesFromConstraints: empty,
+		};
+	}
+	const inSchemas = (column: string) =>
+		`${column} IN (${schemaNames.map((it) => `'${it.replaceAll("'", "''")}'`).join(', ')})`;
+
+	const columns = await db.query<CatalogRow>(
+		`SELECT
+    ns.nspname AS _schema,
+    cls.relname AS _table,
+    a.attrelid::regclass::text AS table_name,
+    a.attname AS column_name,
+    CASE
+        WHEN NOT a.attisdropped THEN
+            CASE
                 WHEN a.attnotnull THEN 'NO'
                 ELSE 'YES'
-            END 
-        ELSE NULL 
-    END AS is_nullable,  -- NULL or NOT NULL constraint
-    a.attndims AS array_dimensions,  -- Array dimensions
-    CASE 
-        WHEN a.atttypid = ANY ('{int,int8,int2}'::regtype[]) 
+            END
+        ELSE NULL
+    END AS is_nullable,
+    a.attndims AS array_dimensions,
+    CASE
+        WHEN a.atttypid = ANY ('{int,int8,int2}'::regtype[])
         AND EXISTS (
             SELECT FROM pg_attrdef ad
-            WHERE ad.adrelid = a.attrelid 
-            AND ad.adnum = a.attnum 
-            AND pg_get_expr(ad.adbin, ad.adrelid) = 'nextval(''' 
+            WHERE ad.adrelid = a.attrelid
+            AND ad.adnum = a.attnum
+            AND pg_get_expr(ad.adbin, ad.adrelid) = 'nextval('''
                 || pg_get_serial_sequence(a.attrelid::regclass::text, a.attname)::regclass || '''::regclass)'
         )
         THEN CASE a.atttypid
@@ -2055,43 +2063,188 @@ const getColumnsInfoQuery = ({ schema, table, db }: { schema: string; table: str
             WHEN 'int2'::regtype THEN 'smallserial'
         END
         ELSE format_type(a.atttypid, a.atttypmod)
-    END AS data_type,  -- Column data type
---    ns.nspname AS type_schema,  -- Schema name
-    pg_get_serial_sequence('"${schema}"."${table}"', a.attname)::regclass AS seq_name,  -- Serial sequence (if any)
-    c.column_default,  -- Column default value
-    c.data_type AS additional_dt,  -- Data type from information_schema
-    c.udt_name AS enum_name,  -- Enum type (if applicable)
-    c.is_generated,  -- Is it a generated column?
-    c.generation_expression,  -- Generation expression (if generated)
-    c.is_identity,  -- Is it an identity column?
-    c.identity_generation,  -- Identity generation strategy (ALWAYS or BY DEFAULT)
-    c.identity_start,  -- Start value of identity column
-    c.identity_increment,  -- Increment for identity column
-    c.identity_maximum,  -- Maximum value for identity column
-    c.identity_minimum,  -- Minimum value for identity column
-    c.identity_cycle,  -- Does the identity column cycle?
-    enum_ns.nspname AS type_schema  -- Schema of the enum type
-FROM 
-    pg_attribute a
-JOIN 
-    pg_class cls ON cls.oid = a.attrelid  -- Join pg_class to get table/view/materialized view info
-JOIN 
-    pg_namespace ns ON ns.oid = cls.relnamespace  -- Join namespace to get schema info
-LEFT JOIN 
-    information_schema.columns c ON c.column_name = a.attname 
-        AND c.table_schema = ns.nspname 
-        AND c.table_name = cls.relname  -- Match schema and table/view name
-LEFT JOIN 
-    pg_type enum_t ON enum_t.oid = a.atttypid  -- Join to get the type info
-LEFT JOIN 
-    pg_namespace enum_ns ON enum_ns.oid = enum_t.typnamespace  -- Join to get the enum schema
-WHERE 
-    a.attnum > 0  -- Valid column numbers only
-    AND NOT a.attisdropped  -- Skip dropped columns
-    AND cls.relkind IN ('r', 'v', 'm')  -- Include regular tables ('r'), views ('v'), and materialized views ('m')
-    AND ns.nspname = '${schema}'  -- Filter by schema
-    AND cls.relname = '${table}'  -- Filter by table name
-ORDER BY 
-    a.attnum;  -- Order by column number`,
+    END AS data_type,
+    pg_get_serial_sequence(format('%I.%I', ns.nspname, cls.relname), a.attname)::regclass AS seq_name,
+    c.column_default,
+    c.data_type AS additional_dt,
+    c.udt_name AS enum_name,
+    c.is_generated,
+    c.generation_expression,
+    c.is_identity,
+    c.identity_generation,
+    c.identity_start,
+    c.identity_increment,
+    c.identity_maximum,
+    c.identity_minimum,
+    c.identity_cycle,
+    enum_ns.nspname AS type_schema
+FROM pg_attribute a
+JOIN pg_class cls ON cls.oid = a.attrelid
+JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+LEFT JOIN information_schema.columns c ON c.column_name = a.attname
+    AND c.table_schema = ns.nspname
+    AND c.table_name = cls.relname
+LEFT JOIN pg_type enum_t ON enum_t.oid = a.atttypid
+LEFT JOIN pg_namespace enum_ns ON enum_ns.oid = enum_t.typnamespace
+WHERE a.attnum > 0
+    AND NOT a.attisdropped
+    AND cls.relkind IN ('r', 'v', 'm')
+    AND ${inSchemas('ns.nspname')}
+ORDER BY ns.nspname, cls.relname, a.attnum;`,
 	);
+
+	const constraints = await db.query<CatalogRow>(
+		`SELECT nsp.nspname AS _schema, rel.relname AS _table,
+        att.attname AS column_name,
+        CASE con.contype WHEN 'p' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END AS constraint_type,
+        con.conname AS constraint_name,
+        nsp.nspname AS constraint_schema
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+      CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS key_col(attnum, ordinality)
+      JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = key_col.attnum
+      WHERE con.contype IN ('p', 'u') AND ${inSchemas('nsp.nspname')}
+      ORDER BY nsp.nspname, rel.relname, con.conname, key_col.ordinality;`,
+	);
+
+	const checks = await db.query<CatalogRow>(
+		`SELECT nsp.nspname AS _schema, rel.relname AS _table,
+        con.conname AS constraint_name,
+        'CHECK' AS constraint_type,
+        pg_get_constraintdef(con.oid) AS constraint_definition
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+      WHERE con.contype = 'c' AND ${inSchemas('nsp.nspname')};`,
+	);
+
+	const foreignKeys = await db.query<CatalogRow>(
+		`SELECT
+            nsp.nspname AS _schema,
+            rel.relname AS _table,
+            con.contype AS constraint_type,
+            nsp.nspname AS constraint_schema,
+            con.conname AS constraint_name,
+            rel.relname AS table_name,
+            att.attname AS column_name,
+            fnsp.nspname AS foreign_table_schema,
+            frel.relname AS foreign_table_name,
+            fatt.attname AS foreign_column_name,
+            CASE con.confupdtype
+              WHEN 'a' THEN 'NO ACTION'
+              WHEN 'r' THEN 'RESTRICT'
+              WHEN 'n' THEN 'SET NULL'
+              WHEN 'c' THEN 'CASCADE'
+              WHEN 'd' THEN 'SET DEFAULT'
+            END AS update_rule,
+            CASE con.confdeltype
+              WHEN 'a' THEN 'NO ACTION'
+              WHEN 'r' THEN 'RESTRICT'
+              WHEN 'n' THEN 'SET NULL'
+              WHEN 'c' THEN 'CASCADE'
+              WHEN 'd' THEN 'SET DEFAULT'
+            END || COALESCE((
+              SELECT ' (' || string_agg(quote_ident(delete_att.attname), ', ' ORDER BY delete_col.ordinality) || ')'
+              FROM jsonb_array_elements_text(NULLIF(to_jsonb(con)->'confdelsetcols', 'null'::jsonb))
+                WITH ORDINALITY AS delete_col(attnum, ordinality)
+              JOIN pg_catalog.pg_attribute delete_att
+                ON delete_att.attrelid = con.conrelid AND delete_att.attnum = delete_col.attnum::smallint
+            ), '') AS delete_rule
+          FROM
+            pg_catalog.pg_constraint con
+            JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+            JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace
+            -- Pair each key column with the column it references, in key order.
+            CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS fk_col(attnum, fattnum, ordinality)
+            LEFT JOIN pg_catalog.pg_attribute att ON att.attnum = fk_col.attnum
+              AND att.attrelid = con.conrelid
+            LEFT JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid
+            LEFT JOIN pg_catalog.pg_namespace fnsp ON fnsp.oid = frel.relnamespace
+            LEFT JOIN pg_catalog.pg_attribute fatt ON fatt.attnum = fk_col.fattnum
+              AND fatt.attrelid = con.confrelid
+          WHERE
+            ${inSchemas('nsp.nspname')}
+            AND con.contype IN ('f')
+          ORDER BY nsp.nspname, rel.relname, con.conname, fk_col.ordinality;`,
+	);
+
+	// NULLS NOT DISTINCT (PostgreSQL 15+) lives on the index behind the constraint. Read it
+	// through to_jsonb so older servers, which have no such column, still work.
+	const nullsNotDistinctUniques = await db.query<CatalogRow>(
+		`SELECT nsp.nspname AS _schema, rel.relname AS _table, con.conname AS constraint_name
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace nsp ON nsp.oid = rel.relnamespace
+      JOIN pg_catalog.pg_index idx ON idx.indexrelid = con.conindid
+      WHERE con.contype = 'u'
+        AND ${inSchemas('nsp.nspname')}
+        AND COALESCE((to_jsonb(idx)->>'indnullsnotdistinct')::boolean, false);`,
+	);
+
+	const primaryKeys = await db.query<CatalogRow>(
+		`SELECT nsp.nspname AS _schema, rel.relname AS _table, con.conname AS primary_key
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace nsp ON nsp.oid = con.connamespace
+      WHERE con.contype = 'p' AND ${inSchemas('nsp.nspname')};`,
+	);
+
+	const indexes = await db.query<CatalogRow>(
+		`SELECT DISTINCT ON (c.nspname, t.relname, ic.relname, k.i) c.nspname AS _schema, t.relname AS _table,
+        t.relname as table_name, ic.relname AS indexname,
+        k.i AS index_order,
+        i.indisunique as is_unique,
+        am.amname as method,
+        ic.reloptions as with,
+        coalesce(a.attname, pg_get_indexdef(i.indexrelid, k.i, false)) AS column_name,
+        -- Per key column: attnum 0 (no pg_attribute row) is an expression.
+        CASE WHEN a.attname IS NULL THEN 1 ELSE 0 END AS is_expression,
+        i.indoption[k.i-1] & 1 = 1 AS descending,
+        i.indoption[k.i-1] & 2 = 2 AS nulls_first,
+        pg_get_expr(i.indpred, i.indrelid) as where,
+        opc.opcname
+      FROM pg_class t
+        JOIN pg_index i ON t.oid = i.indrelid
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        CROSS JOIN LATERAL (SELECT unnest(i.indkey), generate_subscripts(i.indkey, 1) + 1) AS k(attnum, i)
+        LEFT JOIN pg_attribute AS a ON i.indrelid = a.attrelid AND k.attnum = a.attnum
+        JOIN pg_namespace c on c.oid = t.relnamespace
+        LEFT JOIN pg_am AS am ON ic.relam = am.oid
+        LEFT JOIN pg_opclass opc ON opc.oid = i.indclass[k.i - 1]
+      WHERE ${inSchemas('c.nspname')}
+        AND k.i <= COALESCE((to_jsonb(i.*)->>'indnkeyatts')::int, i.indnatts)
+      ORDER BY c.nspname, t.relname, ic.relname, k.i;`,
+	);
+
+	const indexesFromConstraints = await db.query<CatalogRow>(
+		`SELECT
+          idx.schemaname AS _schema,
+          idx.relname AS _table,
+          idx.indexrelname AS index_name,
+          idx.relname AS table_name,
+          idx.schemaname,
+          CASE WHEN con.conname IS NOT NULL THEN 1 ELSE 0 END AS generated_by_constraint
+        FROM
+          pg_stat_user_indexes idx
+        LEFT JOIN
+          pg_constraint con ON con.conindid = idx.indexrelid
+            -- A foreign key stores the referenced index in conindid too. Only count constraints
+            -- that this index backs on its own table (primary key, unique, exclusion).
+            AND con.conrelid = idx.relid
+            AND con.contype IN ('p', 'u', 'x')
+        WHERE ${inSchemas('idx.schemaname')}
+        group by idx.schemaname, idx.relname, idx.indexrelname, generated_by_constraint;`,
+	);
+
+	return {
+		columns: groupByTable(columns),
+		constraints: groupByTable(constraints),
+		checks: groupByTable(checks),
+		foreignKeys: groupByTable(foreignKeys),
+		nullsNotDistinctUniques: groupByTable(nullsNotDistinctUniques),
+		primaryKeys: groupByTable(primaryKeys),
+		indexes: groupByTable(indexes),
+		indexesFromConstraints: groupByTable(indexesFromConstraints),
+	};
 };

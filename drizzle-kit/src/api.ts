@@ -43,8 +43,8 @@ import type { Config } from './index';
 import { MySqlSchema as MySQLSchemaKit, mysqlSchema, squashMysqlScheme } from './serializer/mysqlSchema';
 import { generateMySqlSnapshot } from './serializer/mysqlSerializer';
 import { prepareFromExports } from './serializer/pgImports';
-import { PgSchema as PgSchemaKit, pgSchema, squashPgScheme } from './serializer/pgSchema';
-import { generatePgSnapshot } from './serializer/pgSerializer';
+import { normalizePgPushSchema, PgSchema as PgSchemaKit, pgSchema, squashPgScheme } from './serializer/pgSchema';
+import { generatePgSnapshot, pgSequenceCacheMinimum } from './serializer/pgSerializer';
 import {
 	SingleStoreSchema as SingleStoreSchemaKit,
 	singlestoreSchema,
@@ -148,10 +148,13 @@ export const pushSchema = async (
 		filters,
 		schemaFilters ?? ['public'],
 		undefined,
+		cur,
 	);
 
 	const validatedPrev = pgSchema.parse(prev);
-	const validatedCur = pgSchema.parse(cur);
+	const validatedCur = normalizePgPushSchema(pgSchema.parse(cur), validatedPrev, {
+		sequenceCacheMinimum: await pgSequenceCacheMinimum(db),
+	});
 
 	const squashedPrev = squashPgScheme(validatedPrev, 'push');
 	const squashedCur = squashPgScheme(validatedCur, 'push');

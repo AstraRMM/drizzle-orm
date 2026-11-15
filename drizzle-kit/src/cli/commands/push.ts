@@ -306,10 +306,12 @@ export const pgPush = async (
 	const { schema } = await pgPushIntrospect(db, tablesFilter, schemasFilter, entities, serialized);
 
 	const { preparePgPush } = await import('./migrate');
+	const { pgSequenceCacheMinimum } = await import('../../serializer/pgSerializer');
 
 	const statements = await preparePgPush(
 		{ id: randomUUID(), prevId: schema.id, ...serialized },
 		schema,
+		{ sequenceCacheMinimum: await pgSequenceCacheMinimum(db) },
 	);
 
 	try {
